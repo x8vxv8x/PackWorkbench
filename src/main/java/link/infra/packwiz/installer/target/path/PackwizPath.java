@@ -69,6 +69,13 @@ public abstract class PackwizPath<T extends PackwizPath<T>> {
 
     protected abstract T construct(String path);
 
+    /**
+     * 获取规范化后的相对路径字符串。
+     */
+    public String path() {
+        return path;
+    }
+
     protected Boolean pathFolder() {
         return path != null ? path.endsWith("/") : null;
     }

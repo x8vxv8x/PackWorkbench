@@ -33,8 +33,15 @@ public class PackFile {
         pf.name = toml.getString("name");
         pf.author = toml.getString("author");
 
-        Long formatVersion = toml.getLong("pack-format");
-        if (formatVersion != null) pf.packFormat = new PackFormat(formatVersion.intValue());
+        // pack-format 可以是数字 (如 1) 或字符串 (如 "packwiz:1.1.0")
+        String formatStr = toml.getString("pack-format");
+        if (formatStr != null) {
+            String version = formatStr.contains(":") ? formatStr.split(":")[1] : formatStr;
+            pf.packFormat = new PackFormat(parseVersion(version));
+        } else {
+            Long formatLong = toml.getLong("pack-format");
+            if (formatLong != null) pf.packFormat = new PackFormat(formatLong.intValue());
+        }
 
         Toml versionsTable = toml.getTable("versions");
         if (versionsTable != null) {
@@ -51,5 +58,14 @@ public class PackFile {
         }
 
         return pf;
+    }
+
+    /** 从版本字符串 (如 "1.1.0") 提取主版本号 */
+    private static int parseVersion(String version) {
+        try {
+            return Integer.parseInt(version.split("\\.")[0]);
+        } catch (Exception e) {
+            return 1;
+        }
     }
 }

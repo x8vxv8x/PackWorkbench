@@ -8,7 +8,7 @@ public enum DownloadMode {
         if (s == null) return URL;
         return switch (s.toLowerCase()) {
             case "url" -> URL;
-            case "curseforge" -> CURSEFORGE;
+            case "curseforge", "metadata:curseforge" -> CURSEFORGE;
             default -> URL;
         };
     }
