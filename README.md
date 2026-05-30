@@ -1,20 +1,27 @@
-# packwiz-installer
-An installer for launching packwiz modpacks with MultiMC.
+# PackWorkbench
 
-## Usage
+一个基于 Java/FlatLaf 的 packwiz + CurseForge 可视化工作台。
 
+## 目标
+
+- 用 packwiz 管理 mods、resourcepacks、shaderpacks 的联网下载和索引。
+- 用外部 Git 工具管理配置、脚本和零碎文件。
+- 以 CurseForge 导出 zip 作为主要打包格式。
+- 不做 Modrinth 搜索、安装、更新或 `.mrpack` 导出。
+
+## 当前能力
+
+- 打开本地 packwiz 项目。
+- 查看 `index.toml` 与 `.pw.toml` 资产表。
+- 创建 URL 下载元数据。
+- 创建 CurseForge 元数据。
+- 刷新 `index.toml` 并更新 `pack.toml` 的 index hash。
+- 执行下载同步。
+- 导出 CurseForge zip，包含 `manifest.json`、`modlist.html` 和 `overrides/`。
+
+## 运行
+
+```powershell
+.\gradlew.bat shadowJar
+java -jar (Get-ChildItem build\libs\*-all.jar | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
 ```
-java -jar packwiz-installer.jar <pack.toml URL or path>
-```
-
-### Options
-
-| Option | Description |
-|---|---|
-| `-s, --side <client/server>` | 安装模组的端 (默认为 client) |
-| `--title <title>` | 安装窗口标题 |
-| `--pack-folder <path>` | 安装整合包的文件夹（默认为当前目录） |
-| `--multimc-folder <path>` | MultiMC 整合包文件夹（默认为整合包目录的上级） |
-| `--meta-file <filename>` | 存储整合包元数据的 JSON 文件（默认为 packwiz.json） |
-| `-t, --timeout <seconds>` | 询问可选模组时自动启动前等待的秒数（默认为 10） |
-| `-g, --no-gui` | 不显示 GUI 界面 |

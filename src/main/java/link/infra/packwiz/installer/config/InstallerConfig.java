@@ -18,6 +18,7 @@ public class InstallerConfig {
     public static final String CONFIG_DIR_NAME = ".packwiz-installer";
     public static final String CONFIG_FILE_NAME = "config.toml";
     public static final String MANIFEST_FILE_NAME = "packwiz.json";
+    public static final String OVERRIDES_IGNORE_FILE_NAME = "overrides.ignore";
 
     public enum SyncMode {
         MODS_ONLY("mods-only"),
@@ -61,6 +62,8 @@ public class InstallerConfig {
     private String title = "";
     private SyncMode syncMode = SyncMode.MODS_ONLY;
     private List<String> syncFolders = new ArrayList<>(Arrays.asList("mods"));
+    private String compatJarTabName = "本地 Jars";
+    private String compatJarFolder = "mods";
 
     // ===== 路径 =====
 
@@ -79,9 +82,45 @@ public class InstallerConfig {
         return getConfigDir(rootDir).resolve(MANIFEST_FILE_NAME);
     }
 
+    public static Path getOverridesIgnoreFile(Path rootDir) {
+        return getConfigDir(rootDir).resolve(OVERRIDES_IGNORE_FILE_NAME);
+    }
+
     /** 确保配置目录存在 */
     public static void ensureConfigDir(Path rootDir) throws IOException {
         Files.createDirectories(getConfigDir(rootDir));
+        Path ignore = getOverridesIgnoreFile(rootDir);
+        if (!Files.exists(ignore)) {
+            Files.writeString(ignore, defaultOverridesIgnore(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private static String defaultOverridesIgnore() {
+        return """
+            # PackWorkbench CurseForge overrides ignore
+            # Syntax is similar to .gitignore. One pattern per line; # starts a comment.
+            # These rules apply only when building overrides/ for CurseForge export.
+
+            .git/
+            .gradle/
+            .idea/
+            build/
+            gradle/
+            src/
+            .packwiz-installer/
+
+            pack.toml
+            index.toml
+            PLAN.md
+            README.md
+            LICENSE
+            *.zip
+
+            mods/.index/
+            resourcepacks/.index/
+            shaderpacks/.index/
+            mods/*.jar
+            """;
     }
 
     // ===== 加载和保存 =====
@@ -134,6 +173,15 @@ public class InstallerConfig {
                 }
             }
 
+            Toml workbench = toml.getTable("workbench");
+            if (workbench != null) {
+                Toml compatJars = workbench.getTable("compat-jars");
+                if (compatJars != null) {
+                    config.compatJarTabName = compatJars.getString("name", "本地 Jars");
+                    config.compatJarFolder = compatJars.getString("folder", "mods");
+                }
+            }
+
             return config;
         } catch (Exception e) {
             Log.warn("读取配置文件失败，使用默认值: " + e.getMessage());
@@ -163,6 +211,9 @@ public class InstallerConfig {
 
         sb.append("[sync]\n");
         sb.append("mode = \"").append(syncMode.configValue()).append("\"\n");
+        sb.append("\n[workbench.compat-jars]\n");
+        sb.append("name = \"").append(escapeToml(compatJarTabName)).append("\"\n");
+        sb.append("folder = \"").append(escapeToml(compatJarFolder)).append("\"\n");
 
         try {
             Files.writeString(configFile, sb.toString(), StandardCharsets.UTF_8);
@@ -307,6 +358,16 @@ public class InstallerConfig {
     public void setSyncMode(SyncMode syncMode) {
         this.syncMode = syncMode != null ? syncMode : SyncMode.MODS_ONLY;
         this.syncFolders = foldersForMode(this.syncMode);
+    }
+
+    public String getCompatJarTabName() { return compatJarTabName; }
+    public void setCompatJarTabName(String compatJarTabName) {
+        this.compatJarTabName = compatJarTabName == null || compatJarTabName.isBlank() ? "本地 Jars" : compatJarTabName;
+    }
+
+    public String getCompatJarFolder() { return compatJarFolder; }
+    public void setCompatJarFolder(String compatJarFolder) {
+        this.compatJarFolder = compatJarFolder == null || compatJarFolder.isBlank() ? "mods" : compatJarFolder;
     }
 
     private static List<String> foldersForMode(SyncMode mode) {

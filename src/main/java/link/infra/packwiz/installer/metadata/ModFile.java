@@ -22,6 +22,7 @@ public class ModFile {
     public String name;
     public PackwizPath<?> filename;
     public Side side = Side.BOTH;
+    public boolean pin = false;
     public Download download;
     public Map<String, UpdateData> update = Map.of();
     public Option option = new Option(false, "", false);
@@ -81,6 +82,8 @@ public class ModFile {
 
         String sideStr = toml.getString("side");
         mf.side = sideStr != null ? Side.from(sideStr) : Side.BOTH;
+        Boolean pin = toml.getBoolean("pin");
+        mf.pin = pin != null && pin;
 
         Toml downloadTable = toml.getTable("download");
         if (downloadTable != null) {
