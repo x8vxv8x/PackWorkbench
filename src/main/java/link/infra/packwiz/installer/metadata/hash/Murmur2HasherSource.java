@@ -15,6 +15,7 @@ public class Murmur2HasherSource extends Hash.HashingInputStream {
     private int length;
     private final byte[] buffer = new byte[4];
     private int bufferPos = 0;
+    private byte[] digest = null;
 
     public Murmur2HasherSource(InputStream upstream) {
         super(upstream, "SHA-1"); // dummy algorithm, we override digest
@@ -62,12 +63,15 @@ public class Murmur2HasherSource extends Hash.HashingInputStream {
 
     @Override
     public byte[] getDigest() {
+        if (digest != null) return digest.clone();
+
         // Process remaining bytes (tail)
         if (bufferPos != 0) {
             if (bufferPos >= 3) h ^= (int) (buffer[2] & 0xff) << 16;
             if (bufferPos >= 2) h ^= (int) (buffer[1] & 0xff) << 8;
             if (bufferPos >= 1) h ^= buffer[0] & 0xff;
             h *= M;
+            bufferPos = 0;
         }
 
         // Finalization
@@ -76,8 +80,9 @@ public class Murmur2HasherSource extends Hash.HashingInputStream {
         h ^= h >>> 15;
 
         // Return as 4-byte little-endian
-        return new byte[] {
+        digest = new byte[] {
             (byte) h, (byte) (h >>> 8), (byte) (h >>> 16), (byte) (h >>> 24)
         };
+        return digest.clone();
     }
 }

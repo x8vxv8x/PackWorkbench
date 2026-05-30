@@ -78,18 +78,26 @@ public class IndexFile {
         /**
          * 从本地读取关联的 mod 元数据文件。
          * 适用于 git+packwiz 工作流，元数据在本地。
-         *
-         * @param index 索引文件
-         * @param packFolder pack 根目录（用于解析 filename 等相对路径）
          */
         public void readLocalMeta(IndexFile index, PackwizPath<?> packFolder) throws Exception {
             if (!metafile) return;
             InputStream input = file.source(null);
             try (input) {
-                // packwiz 的 filename 是相对于 pack 根目录的，不是相对于 .pw.toml 的位置
-                ModFile modFile = ModFile.fromToml(input, packFolder);
+                ModFile modFile = ModFile.fromToml(input, metadataTargetFolder());
                 this.linkedFile = modFile;
             }
+        }
+
+        private PackwizPath<?> metadataTargetFolder() {
+            String metaPath = file.path();
+            if (metaPath != null && metaPath.endsWith(".pw.toml")) {
+                int indexMarker = metaPath.lastIndexOf("/.index/");
+                if (indexMarker >= 0) {
+                    String parent = metaPath.substring(0, indexMarker + 1);
+                    return file.resolve("/" + parent);
+                }
+            }
+            return file.parent();
         }
 
         /**

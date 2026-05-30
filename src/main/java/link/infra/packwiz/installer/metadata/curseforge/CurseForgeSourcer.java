@@ -2,10 +2,11 @@ package link.infra.packwiz.installer.metadata.curseforge;
 
 import com.google.gson.Gson;
 import link.infra.packwiz.installer.metadata.IndexFile;
+import link.infra.packwiz.installer.metadata.ModFile;
+import link.infra.packwiz.installer.metadata.hash.HashFormat;
 import link.infra.packwiz.installer.target.ClientHolder;
 import link.infra.packwiz.installer.target.path.HttpUrlPath;
 import link.infra.packwiz.installer.target.path.PackwizFilePath;
-import link.infra.packwiz.installer.ui.data.ExceptionDetails;
 
 import java.io.*;
 import java.net.URI;
@@ -25,6 +26,7 @@ public class CurseForgeSourcer {
 
     private record GetFilesRequest(List<Integer> fileIds) {}
     private record GetModsRequest(List<Integer> modIds) {}
+    public record ResolveFailure(IndexFile.FileEntry entry, String name, Exception exception, String url, boolean manualOnly) {}
 
     private static class GetFilesResponse {
         List<CfFile> data = new ArrayList<>();
@@ -32,6 +34,11 @@ public class CurseForgeSourcer {
             int id;
             int modId;
             String downloadUrl;
+            List<CfHash> hashes = new ArrayList<>();
+        }
+        static class CfHash {
+            int algo;
+            String value;
         }
     }
 
@@ -47,19 +54,22 @@ public class CurseForgeSourcer {
         }
     }
 
-    public static List<ExceptionDetails> resolveCfMetadata(
+    public static List<ResolveFailure> resolveCfMetadata(
         List<IndexFile.FileEntry> mods,
         PackwizFilePath packFolder,
         ClientHolder clientHolder
     ) {
-        var failures = new ArrayList<ExceptionDetails>();
+        var failures = new ArrayList<ResolveFailure>();
         var fileIdMap = new HashMap<Integer, List<IndexFile.FileEntry>>();
 
         for (var mod : mods) {
             if (mod.linkedFile == null || !mod.linkedFile.update.containsKey("curseforge")) {
-                failures.add(new ExceptionDetails(
+                failures.add(new ResolveFailure(
+                    mod,
                     mod.linkedFile != null ? mod.linkedFile.name : "unknown",
-                    new Exception("解析 CurseForge 元数据失败：没有 CurseForge 更新部分")
+                    new Exception("解析 CurseForge 元数据失败：没有 CurseForge 更新部分"),
+                    null,
+                    false
                 ));
                 continue;
             }
@@ -74,12 +84,12 @@ public class CurseForgeSourcer {
         try {
             res = clientHolder.httpRequest(req);
         } catch (Exception e) {
-            failures.add(new ExceptionDetails("其他", new Exception("解析 CurseForge 文件数据元数据失败：" + e.getMessage())));
+            failures.add(new ResolveFailure(null, "其他", new Exception("解析 CurseForge 文件数据元数据失败：" + e.getMessage()), null, false));
             return failures;
         }
         if (res.statusCode() < 200 || res.statusCode() >= 300 || res.body() == null) {
             try { if (res.body() != null) res.body().close(); } catch (IOException ignored) {}
-            failures.add(new ExceptionDetails("其他", new Exception("解析 CurseForge 文件数据元数据失败：错误代码 " + res.statusCode())));
+            failures.add(new ResolveFailure(null, "其他", new Exception("解析 CurseForge 文件数据元数据失败：错误代码 " + res.statusCode()), null, false));
             return failures;
         }
 
@@ -87,17 +97,18 @@ public class CurseForgeSourcer {
         try (var body = res.body()) {
             resData = GSON.fromJson(new InputStreamReader(body, StandardCharsets.UTF_8), GetFilesResponse.class);
         } catch (IOException e) {
-            failures.add(new ExceptionDetails("其他", new Exception("读取 CurseForge 响应失败：" + e.getMessage())));
+            failures.add(new ResolveFailure(null, "其他", new Exception("读取 CurseForge 响应失败：" + e.getMessage()), null, false));
             return failures;
         }
 
         var manualDownloadMods = new HashMap<Integer, List<Integer>>();
         for (var file : resData.data) {
             if (!fileIdMap.containsKey(file.id)) {
-                failures.add(new ExceptionDetails(String.valueOf(file.id),
-                    new Exception("从结果中找不到文件：ID " + file.id + "，项目 ID " + file.modId)));
+                failures.add(new ResolveFailure(null, String.valueOf(file.id),
+                    new Exception("从结果中找不到文件：ID " + file.id + "，项目 ID " + file.modId), null, false));
                 continue;
             }
+            applyCurseForgeSha1(file, fileIdMap.get(file.id));
             if (file.downloadUrl == null) {
                 manualDownloadMods.computeIfAbsent(file.modId, k -> new ArrayList<>()).add(file.id);
                 continue;
@@ -107,8 +118,8 @@ public class CurseForgeSourcer {
                     indexFile.linkedFile.resolvedUpdateData.put("curseforge", new HttpUrlPath(URI.create(file.downloadUrl)));
                 }
             } catch (IllegalArgumentException e) {
-                failures.add(new ExceptionDetails(String.valueOf(file.id),
-                    new Exception("解析 URL 失败：" + file.downloadUrl + "，ID " + file.id + "，项目 ID " + file.modId, e)));
+                failures.add(new ResolveFailure(null, String.valueOf(file.id),
+                    new Exception("解析 URL 失败：" + file.downloadUrl + "，ID " + file.id + "，项目 ID " + file.modId, e), null, false));
             }
         }
 
@@ -130,12 +141,12 @@ public class CurseForgeSourcer {
             try {
                 resMods = clientHolder.httpRequest(reqMods);
             } catch (Exception e) {
-                failures.add(new ExceptionDetails("其他", new Exception("解析 CurseForge 模组数据元数据失败：" + e.getMessage())));
+                failures.add(new ResolveFailure(null, "其他", new Exception("解析 CurseForge 模组数据元数据失败：" + e.getMessage()), null, false));
                 return failures;
             }
             if (resMods.statusCode() < 200 || resMods.statusCode() >= 300 || resMods.body() == null) {
                 try { if (resMods.body() != null) resMods.body().close(); } catch (IOException ignored) {}
-                failures.add(new ExceptionDetails("其他", new Exception("解析 CurseForge 模组数据元数据失败：错误代码 " + resMods.statusCode())));
+                failures.add(new ResolveFailure(null, "其他", new Exception("解析 CurseForge 模组数据元数据失败：错误代码 " + resMods.statusCode()), null, false));
                 return failures;
             }
 
@@ -143,31 +154,48 @@ public class CurseForgeSourcer {
             try (var body = resMods.body()) {
                 resModsData = GSON.fromJson(new InputStreamReader(body, StandardCharsets.UTF_8), GetModsResponse.class);
             } catch (IOException e) {
-                failures.add(new ExceptionDetails("其他", new Exception("读取 CurseForge 模组响应失败：" + e.getMessage())));
+                failures.add(new ResolveFailure(null, "其他", new Exception("读取 CurseForge 模组响应失败：" + e.getMessage()), null, false));
                 return failures;
             }
 
             for (var mod : resModsData.data) {
                 if (!manualDownloadMods.containsKey(mod.id)) {
-                    failures.add(new ExceptionDetails(mod.name, new Exception("从结果中找不到项目：ID " + mod.id)));
+                    failures.add(new ResolveFailure(null, mod.name, new Exception("从结果中找不到项目：ID " + mod.id), null, false));
                     continue;
                 }
                 for (int fileId : manualDownloadMods.get(mod.id)) {
                     if (!fileIdMap.containsKey(fileId)) {
-                        failures.add(new ExceptionDetails(mod.name, new Exception("从结果中找不到文件：文件 ID " + fileId)));
+                        failures.add(new ResolveFailure(null, mod.name, new Exception("从结果中找不到文件：文件 ID " + fileId), null, false));
                         continue;
                     }
                     for (var indexFile : fileIdMap.get(fileId)) {
                         String modUrl = (mod.links != null ? mod.links.websiteUrl : "") + "/files/" + fileId;
-                        failures.add(new ExceptionDetails(indexFile.linkedFile.name,
+                        failures.add(new ResolveFailure(indexFile, indexFile.linkedFile.name,
                             new Exception("此模组已从 CurseForge API 中排除，必须手动下载。\n请前往 " + modUrl + " 并将此文件保存到 " + indexFile.getDestURI().rebase(packFolder)),
-                            modUrl));
+                            modUrl, true));
                     }
                 }
             }
         }
 
         return failures;
+    }
+
+    private static void applyCurseForgeSha1(GetFilesResponse.CfFile file, List<IndexFile.FileEntry> entries) {
+        String sha1 = file.hashes == null ? null : file.hashes.stream()
+            .filter(hash -> hash.algo == 1)
+            .map(hash -> hash.value)
+            .filter(Objects::nonNull)
+            .filter(value -> value.length() == 40)
+            .findFirst()
+            .orElse(null);
+        if (sha1 == null) return;
+
+        for (var entry : entries) {
+            if (entry.linkedFile == null || entry.linkedFile.download == null) continue;
+            var old = entry.linkedFile.download;
+            entry.linkedFile.download = new ModFile.Download(old.url(), HashFormat.SHA1, sha1, old.mode());
+        }
     }
 
     private static HttpRequest buildCfApiRequest(String endpoint, String jsonBody) {

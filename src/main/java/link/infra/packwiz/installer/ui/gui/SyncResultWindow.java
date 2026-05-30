@@ -20,7 +20,7 @@ public class SyncResultWindow extends JDialog {
         mainPanel.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
 
         // 顶部统计
-        int successCount = result.added.size() + result.removed.size();
+        int successCount = result.added.size() + result.updated.size() + result.removed.size();
         int failCount = result.failed.size();
         var summaryLabel = new JLabel(String.format(
             "成功: %d 个    失败: %d 个", successCount, failCount
@@ -35,11 +35,14 @@ public class SyncResultWindow extends JDialog {
 
         var sb = new StringBuilder();
 
-        if (!result.added.isEmpty()) {
+        if (!result.added.isEmpty() || !result.updated.isEmpty()) {
             sb.append("新增/更新成功:\n");
             for (var mod : result.added) {
-                String type = mod.changeType.equals("added") ? "新增" : "更新";
-                sb.append("  [").append(type).append("] ").append(mod.name).append("\n");
+                sb.append("  [新增] ").append(mod.name).append("\n");
+                sb.append("    ").append(mod.destPath).append("\n");
+            }
+            for (var mod : result.updated) {
+                sb.append("  [更新] ").append(mod.name).append("\n");
                 sb.append("    ").append(mod.destPath).append("\n");
             }
             sb.append("\n");
@@ -65,7 +68,7 @@ public class SyncResultWindow extends JDialog {
             }
         }
 
-        if (result.failed.isEmpty() && result.added.isEmpty() && result.removed.isEmpty()) {
+        if (result.failed.isEmpty() && result.added.isEmpty() && result.updated.isEmpty() && result.removed.isEmpty()) {
             sb.append("无需更改，已是最新版本。\n");
         }
 

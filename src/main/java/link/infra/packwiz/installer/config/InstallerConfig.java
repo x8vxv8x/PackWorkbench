@@ -19,6 +19,39 @@ public class InstallerConfig {
     public static final String CONFIG_FILE_NAME = "config.toml";
     public static final String MANIFEST_FILE_NAME = "packwiz.json";
 
+    public enum SyncMode {
+        MODS_ONLY("mods-only"),
+        CONFIGURED_FILES("configured-files");
+
+        private final String configValue;
+
+        SyncMode(String configValue) {
+            this.configValue = configValue;
+        }
+
+        public String configValue() {
+            return configValue;
+        }
+
+        public static SyncMode fromConfigValue(String value) {
+            if (value == null || value.isBlank()) return MODS_ONLY;
+            return switch (value.trim().toLowerCase()) {
+                case "mods-only", "mods", "mods_only" -> MODS_ONLY;
+                case "configured-files", "configured", "all", "configured_files" -> CONFIGURED_FILES;
+                default -> {
+                    Log.warn("未知同步模式，使用默认值 mods-only: " + value);
+                    yield MODS_ONLY;
+                }
+            };
+        }
+
+        public static SyncMode fromLegacyFolders(List<String> folders) {
+            if (folders == null || folders.isEmpty()) return MODS_ONLY;
+            boolean onlyMods = folders.size() == 1 && "mods".equalsIgnoreCase(folders.get(0));
+            return onlyMods ? MODS_ONLY : CONFIGURED_FILES;
+        }
+    }
+
     private String packUrl = "";
     private String side = "client";
     private String installFolder = ".";
@@ -26,7 +59,8 @@ public class InstallerConfig {
     private String multimcFolder = "";
     private long timeout = 10;
     private String title = "";
-    private List<String> syncFolders = new ArrayList<>(Arrays.asList("mods", "resourcepacks", "shaderpacks"));
+    private SyncMode syncMode = SyncMode.MODS_ONLY;
+    private List<String> syncFolders = new ArrayList<>(Arrays.asList("mods"));
 
     // ===== 路径 =====
 
@@ -71,6 +105,7 @@ public class InstallerConfig {
             if (install != null) {
                 config.installFolder = install.getString("folder", ".");
                 config.metaFile = install.getString("meta-file", MANIFEST_FILE_NAME);
+                config.migrateModsFolderInstallRoot();
             }
 
             Toml multimc = toml.getTable("multimc");
@@ -86,9 +121,16 @@ public class InstallerConfig {
 
             Toml sync = toml.getTable("sync");
             if (sync != null) {
-                List<String> folders = sync.getList("folders");
-                if (folders != null && !folders.isEmpty()) {
-                    config.syncFolders = new ArrayList<>(folders);
+                String mode = sync.getString("mode");
+                if (mode != null) {
+                    config.syncMode = SyncMode.fromConfigValue(mode);
+                    config.syncFolders = foldersForMode(config.syncMode);
+                } else {
+                    List<String> folders = sync.getList("folders");
+                    if (folders != null && !folders.isEmpty()) {
+                        config.syncFolders = new ArrayList<>(folders);
+                        config.syncMode = SyncMode.fromLegacyFolders(folders);
+                    }
                 }
             }
 
@@ -120,12 +162,7 @@ public class InstallerConfig {
         sb.append("title = \"").append(escapeToml(title)).append("\"\n\n");
 
         sb.append("[sync]\n");
-        sb.append("folders = [");
-        for (int i = 0; i < syncFolders.size(); i++) {
-            if (i > 0) sb.append(", ");
-            sb.append("\"").append(escapeToml(syncFolders.get(i))).append("\"");
-        }
-        sb.append("]\n");
+        sb.append("mode = \"").append(syncMode.configValue()).append("\"\n");
 
         try {
             Files.writeString(configFile, sb.toString(), StandardCharsets.UTF_8);
@@ -227,6 +264,16 @@ public class InstallerConfig {
         return resolveInstallFolder(rootDir).resolve(metaFile);
     }
 
+    private void migrateModsFolderInstallRoot() {
+        if (installFolder == null || installFolder.isBlank()) return;
+        Path path = Path.of(installFolder);
+        Path fileName = path.getFileName();
+        if (fileName != null && "mods".equalsIgnoreCase(fileName.toString()) && path.getParent() != null) {
+            installFolder = path.getParent().toString();
+            Log.info("检测到安装目录指向 mods 文件夹，已迁移为整合包根目录: " + installFolder);
+        }
+    }
+
     // ===== Getter/Setter =====
 
     public String getPackUrl() { return packUrl; }
@@ -251,7 +298,23 @@ public class InstallerConfig {
     public void setTitle(String title) { this.title = title; }
 
     public List<String> getSyncFolders() { return syncFolders; }
-    public void setSyncFolders(List<String> syncFolders) { this.syncFolders = syncFolders; }
+    public void setSyncFolders(List<String> syncFolders) {
+        this.syncFolders = syncFolders != null ? new ArrayList<>(syncFolders) : new ArrayList<>();
+        this.syncMode = SyncMode.fromLegacyFolders(this.syncFolders);
+    }
+
+    public SyncMode getSyncMode() { return syncMode; }
+    public void setSyncMode(SyncMode syncMode) {
+        this.syncMode = syncMode != null ? syncMode : SyncMode.MODS_ONLY;
+        this.syncFolders = foldersForMode(this.syncMode);
+    }
+
+    private static List<String> foldersForMode(SyncMode mode) {
+        return switch (mode != null ? mode : SyncMode.MODS_ONLY) {
+            case MODS_ONLY -> new ArrayList<>(List.of("mods"));
+            case CONFIGURED_FILES -> new ArrayList<>(List.of("*"));
+        };
+    }
 
     private static String escapeToml(String s) {
         if (s == null) return "";

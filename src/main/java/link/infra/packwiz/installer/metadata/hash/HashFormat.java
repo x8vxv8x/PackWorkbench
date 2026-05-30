@@ -16,6 +16,12 @@ public enum HashFormat {
         public Hash.HashingInputStream createSource(InputStream upstream) {
             return new Murmur2HasherSource(upstream);
         }
+
+        @Override
+        public Hash<?> fromString(String hashStr) {
+            long parsed = Long.parseUnsignedLong(hashStr);
+            return new Hash<>(Hash.Encoding.UINT.decode(parsed), Hash.Encoding.UINT);
+        }
     };
 
     private final String algorithm;
@@ -38,8 +44,12 @@ public enum HashFormat {
      */
     @SuppressWarnings("unchecked")
     public Hash<?> fromString(String hashStr) {
-        byte[] decoded = ((Hash.Encoding<Object>) encoding).decode(hashStr);
-        return new Hash<>(decoded, encoding);
+        try {
+            byte[] decoded = ((Hash.Encoding<Object>) encoding).decode(hashStr);
+            return new Hash<>(decoded, encoding);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("非法 " + name().toLowerCase() + " hash: " + hashStr, e);
+        }
     }
 
     /**

@@ -57,14 +57,14 @@ public class Hash<T> {
         Encoding<Long> UINT = new Encoding<>() {
             @Override public Long encode(byte[] hash) {
                 long result = 0;
-                for (int i = 0; i < Math.min(8, hash.length); i++) {
+                for (int i = 0; i < Math.min(4, hash.length); i++) {
                     result |= ((long) (hash[i] & 0xFF)) << (i * 8);
                 }
-                return result;
+                return result & 0xffffffffL;
             }
             @Override public byte[] decode(Long encoded) {
-                byte[] result = new byte[8];
-                for (int i = 0; i < 8; i++) {
+                byte[] result = new byte[4];
+                for (int i = 0; i < 4; i++) {
                     result[i] = (byte) (encoded >> (i * 8));
                 }
                 return result;

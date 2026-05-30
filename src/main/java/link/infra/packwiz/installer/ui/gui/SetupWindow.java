@@ -2,6 +2,7 @@ package link.infra.packwiz.installer.ui.gui;
 
 import link.infra.packwiz.installer.Main;
 import link.infra.packwiz.installer.config.InstallerConfig;
+import link.infra.packwiz.installer.config.InstallerConfig.SyncMode;
 import link.infra.packwiz.installer.target.Side;
 import link.infra.packwiz.installer.util.Log;
 
@@ -30,14 +31,8 @@ public class SetupWindow extends JFrame {
     private JTextField metaFileField;
     private JSpinner timeoutSpinner;
 
-    // 同步文件夹选择
-    private final Map<String, JCheckBox> folderCheckboxes = new LinkedHashMap<>();
-    private static final String[] DEFAULT_FOLDERS = {"mods", "resourcepacks", "shaderpacks"};
-    private static final String[] ALL_KNOWN_FOLDERS = {
-        "mods", "resourcepacks", "shaderpacks", "config", "scripts",
-        "resources", "oresources", "addons", "structures", "patchouli_books",
-        "groovy", "bansoukou"
-    };
+    private JRadioButton modsOnlyRadio;
+    private JRadioButton configuredFilesRadio;
 
     // 日志面板
     private JTextArea logArea;
@@ -139,30 +134,21 @@ public class SetupWindow extends JFrame {
         row++;
 
         // --- 同步范围 ---
-        var syncToggle = new JCheckBox("同步范围设置");
-        syncToggle.setSelected(true);
         gbc.gridx = 0; gbc.gridy = row; gbc.gridwidth = 4;
-        formPanel.add(syncToggle, gbc);
+        formPanel.add(new JLabel("同步范围:"), gbc);
         gbc.gridwidth = 1;
         row++;
 
-        var syncPanel = new JPanel(new GridBagLayout());
-        syncPanel.setBorder(BorderFactory.createTitledBorder("同步文件夹"));
-        var sgbc = new GridBagConstraints();
-        sgbc.insets = new Insets(2, 4, 2, 4);
-        sgbc.anchor = GridBagConstraints.WEST;
-        int srow = 0;
-
-        for (String folder : ALL_KNOWN_FOLDERS) {
-            JCheckBox cb = new JCheckBox(folder);
-            folderCheckboxes.put(folder, cb);
-            sgbc.gridx = srow % 3;
-            sgbc.gridy = srow / 3;
-            syncPanel.add(cb, sgbc);
-            srow++;
-        }
-
-        syncToggle.addActionListener(e -> syncPanel.setVisible(syncToggle.isSelected()));
+        modsOnlyRadio = new JRadioButton("仅同步 mods");
+        modsOnlyRadio.setToolTipText("只同步 index 中位于 mods/ 下的文件，适合本地 git+packwiz 模组下载工作流。");
+        configuredFilesRadio = new JRadioButton("按配置文件同步");
+        configuredFilesRadio.setToolTipText("同步 packwiz index 中配置的所有文件，包括 config、scripts、resourcepacks 等。");
+        var syncGroup = new ButtonGroup();
+        syncGroup.add(modsOnlyRadio);
+        syncGroup.add(configuredFilesRadio);
+        var syncPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        syncPanel.add(modsOnlyRadio);
+        syncPanel.add(configuredFilesRadio);
 
         gbc.gridx = 0; gbc.gridy = row; gbc.gridwidth = 4; gbc.fill = GridBagConstraints.HORIZONTAL;
         formPanel.add(syncPanel, gbc);
@@ -282,11 +268,10 @@ public class SetupWindow extends JFrame {
         metaFileField.setText(config.getMetaFile());
         timeoutSpinner.setValue((int) config.getTimeout());
 
-        // 同步文件夹
-        List<String> configuredFolders = config.getSyncFolders();
-        for (var entry : folderCheckboxes.entrySet()) {
-            entry.getValue().setSelected(configuredFolders.contains(entry.getKey())
-                || configuredFolders.contains("*"));
+        if (config.getSyncMode() == SyncMode.CONFIGURED_FILES) {
+            configuredFilesRadio.setSelected(true);
+        } else {
+            modsOnlyRadio.setSelected(true);
         }
     }
 
@@ -329,9 +314,9 @@ public class SetupWindow extends JFrame {
             return;
         }
         if (found.size() == 1) {
-            installFolderField.setText(found.get(0).toString());
+            installFolderField.setText(found.get(0).getParent().toString());
         } else {
-            String[] paths = found.stream().map(Path::toString).toArray(String[]::new);
+            String[] paths = found.stream().map(path -> path.getParent().toString()).toArray(String[]::new);
             String selected = (String) JOptionPane.showInputDialog(this,
                 "找到多个安装目录，请选择:", "扫描结果",
                 JOptionPane.PLAIN_MESSAGE, null, paths, paths[0]);
@@ -365,18 +350,6 @@ public class SetupWindow extends JFrame {
             return;
         }
 
-        // 收集同步文件夹
-        List<String> syncFolders = new ArrayList<>();
-        for (var entry : folderCheckboxes.entrySet()) {
-            if (entry.getValue().isSelected()) {
-                syncFolders.add(entry.getKey());
-            }
-        }
-        if (syncFolders.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "请至少选择一个同步文件夹！", "验证失败", JOptionPane.WARNING_MESSAGE);
-            return;
-        }
-
         // 保存到配置
         config.setPackUrl(url);
         if (bothRadio.isSelected()) config.setSide("both");
@@ -386,7 +359,7 @@ public class SetupWindow extends JFrame {
         config.setMultimcFolder(multimcFolderField.getText().trim());
         config.setMetaFile(metaFileField.getText().trim());
         config.setTimeout((int) timeoutSpinner.getValue());
-        config.setSyncFolders(syncFolders);
+        config.setSyncMode(configuredFilesRadio.isSelected() ? SyncMode.CONFIGURED_FILES : SyncMode.MODS_ONLY);
         config.save(rootDir);
 
         // 禁用按钮
@@ -416,29 +389,39 @@ public class SetupWindow extends JFrame {
                 }
 
                 // 在 EDT 显示预览窗口
+                final boolean[] syncStarted = {false};
                 SwingUtilities.invokeAndWait(() -> {
                     var previewWindow = new SyncPreviewWindow(this, preview);
                     previewWindow.setVisible(true);
 
                     if (previewWindow.isConfirmed()) {
+                        syncStarted[0] = true;
                         // 用户确认同步，显示进度并执行
                         var progressDialog = new JProgressDialog(this);
+                        int totalTasks = preview.added.size() + preview.updated.size() + preview.removed.size();
+                        progressDialog.setMaximum(Math.max(totalTasks, 1));
                         progressDialog.setVisible(true);
 
                         new Thread(() -> {
-                            var result = syncManager.executeSync(preview, (completed, status) -> {
-                                SwingUtilities.invokeLater(() -> progressDialog.updateProgress(completed, status));
-                            });
-                            SwingUtilities.invokeLater(() -> {
-                                progressDialog.dispose();
-                                var resultWindow = new SyncResultWindow(this, result);
-                                resultWindow.setVisible(true);
-                            });
+                            try {
+                                var result = syncManager.executeSync(preview, (completed, status) -> {
+                                    SwingUtilities.invokeLater(() -> progressDialog.updateProgress(completed, status));
+                                });
+                                SwingUtilities.invokeLater(() -> {
+                                    progressDialog.dispose();
+                                    var resultWindow = new SyncResultWindow(this, result);
+                                    resultWindow.setVisible(true);
+                                });
+                            } finally {
+                                syncManager.close();
+                            }
                         }).start();
                     }
                 });
 
-                syncManager.close();
+                if (!syncStarted[0]) {
+                    syncManager.close();
+                }
             } catch (Exception e) {
                 Log.warn("同步检查失败: " + e.getMessage());
                 SwingUtilities.invokeLater(() -> {
@@ -478,6 +461,10 @@ public class SetupWindow extends JFrame {
         void updateProgress(int completed, String status) {
             statusLabel.setText(status);
             progressBar.setValue(completed);
+        }
+
+        void setMaximum(int maximum) {
+            progressBar.setMaximum(maximum);
         }
     }
 }

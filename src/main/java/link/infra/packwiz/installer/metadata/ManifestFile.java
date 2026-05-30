@@ -35,6 +35,7 @@ public class ManifestFile {
         public Hash<?> hash = null;
         public Hash<?> linkedFileHash = null;
         public PackwizFilePath cachedLocation = null;
+        public PackwizFilePath metaFile = null;
 
         public boolean isOptional = false;
         public boolean optionValue = true;
@@ -45,6 +46,7 @@ public class ManifestFile {
             revert.hash = hash;
             revert.linkedFileHash = linkedFileHash;
             revert.cachedLocation = cachedLocation;
+            revert.metaFile = metaFile;
             revert.isOptional = isOptional;
             revert.optionValue = optionValue;
             revert.onlyOtherSide = onlyOtherSide;
@@ -55,6 +57,7 @@ public class ManifestFile {
                 hash = revert.hash;
                 linkedFileHash = revert.linkedFileHash;
                 cachedLocation = revert.cachedLocation;
+                metaFile = revert.metaFile;
                 isOptional = revert.isOptional;
                 optionValue = revert.optionValue;
                 onlyOtherSide = revert.onlyOtherSide;

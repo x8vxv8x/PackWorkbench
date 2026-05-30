@@ -10,17 +10,14 @@ import link.infra.packwiz.installer.target.Side;
 import link.infra.packwiz.installer.target.path.HttpUrlPath;
 import link.infra.packwiz.installer.target.path.PackwizFilePath;
 import link.infra.packwiz.installer.target.path.PackwizPath;
-import link.infra.packwiz.installer.ui.data.ExceptionDetails;
 import link.infra.packwiz.installer.util.Log;
 
 import java.io.*;
 import java.net.URI;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
-import java.util.HexFormat;
 
 /**
  * 同步管理器。
@@ -71,6 +68,10 @@ public class SyncManager {
         }
     }
 
+    private record DownloadInfo(PackwizPath<?> source, String displayUrl, HashFormat hashFormat, String expectedHash) {}
+    private record DownloadTaskResult(ModChange change, Exception error) {}
+    private record ExpectedHash(HashFormat format, String hash) {}
+
     public SyncManager(InstallerConfig config, Path rootDir) {
         this.config = config;
         this.rootDir = rootDir;
@@ -112,20 +113,23 @@ public class SyncManager {
         // 过滤同步范围内的条目
         List<IndexFile.FileEntry> syncedEntries = new ArrayList<>();
         for (var entry : indexFile.files) {
-            PackwizPath<?> destUri = entry.getDestURI();
-            String relativePath = destUri.rebase(packFolder).path();
-            if (shouldSync(relativePath)) {
+            if (isEntryInSyncScope(entry, packFolder)) {
                 syncedEntries.add(entry);
             }
         }
         Log.info("同步范围: " + syncedEntries.size() + " / " + indexFile.files.size() + " 个条目");
 
         // 读取本地 .pw.toml 元数据
-        for (var entry : syncedEntries) {
+        boolean metadataReadFailed = false;
+        var syncedIterator = syncedEntries.iterator();
+        while (syncedIterator.hasNext()) {
+            var entry = syncedIterator.next();
             if (entry.metafile) {
                 try {
                     entry.readLocalMeta(indexFile, packFolder);
                 } catch (Exception e) {
+                    metadataReadFailed = true;
+                    syncedIterator.remove();
                     Log.warn("读取元数据失败: " + entry.file + " - " + e.getMessage());
                 }
             }
@@ -146,8 +150,7 @@ public class SyncManager {
         // 构建 index map: destPath -> FileEntry
         Map<String, IndexFile.FileEntry> indexMap = new LinkedHashMap<>();
         for (var entry : syncedEntries) {
-            PackwizPath<?> destUri = entry.getDestURI();
-            String destPath = destUri.rebase(packFolder).path();
+            String destPath = relativeDestPath(entry, packFolder);
             if (destPath != null) {
                 indexMap.put(destPath, entry);
             }
@@ -156,7 +159,7 @@ public class SyncManager {
         // 磁盘失效检查
         boolean invalidateAll = !"both".equals(config.getSide()) && config.getSide() != null
             && !config.getSide().equals(manifest.cachedSide != null ? manifest.cachedSide.name().toLowerCase() : "");
-        List<PackwizFilePath> invalidatedUris = new ArrayList<>();
+        Set<String> invalidatedPaths = new HashSet<>();
         if (!invalidateAll) {
             for (var manifestEntry : manifest.cachedFiles.entrySet()) {
                 ManifestFile.File file = manifestEntry.getValue();
@@ -164,18 +167,18 @@ public class SyncManager {
                 if (!file.isOptional || file.optionValue) {
                     if (file.cachedLocation != null) {
                         if (!Files.exists(file.cachedLocation.nioPath())) {
-                            invalidatedUris.add(manifestEntry.getKey());
+                            invalidatedPaths.add(normalizeRelativePath(manifestEntry.getKey().path()));
                             Log.info("文件已失效: " + manifestEntry.getKey());
                         }
                     } else {
-                        invalidatedUris.add(manifestEntry.getKey());
+                        invalidatedPaths.add(normalizeRelativePath(manifestEntry.getKey().path()));
                     }
                 }
             }
         }
 
         // Pack Hash 快速跳过
-        if (!invalidateAll && currentPackHash.equals(manifest.packFileHash) && invalidatedUris.isEmpty()) {
+        if (!metadataReadFailed && !invalidateAll && currentPackHash.equals(manifest.packFileHash) && invalidatedPaths.isEmpty()) {
             Log.info("Pack 未变化，无需同步");
             result.unchanged = true;
             return result;
@@ -186,14 +189,10 @@ public class SyncManager {
             String destPath = indexEntry.getKey();
             var fileEntry = indexEntry.getValue();
 
-            // 只处理 metafile 条目（需要下载实际文件）
-            if (!fileEntry.metafile) continue;
-
             String modName = fileEntry.getName();
-            var dlInfo = getDownloadInfo(fileEntry);
-            String downloadUrl = dlInfo != null ? dlInfo.url() : "";
-            String downloadHash = dlInfo != null ? dlInfo.hash() : "";
-            // 用 index 中的 metafile hash 做 diff 对比（与 manifest 中存储的一致）
+            var dlInfo = getDownloadInfo(fileEntry, indexFile);
+            String downloadUrl = dlInfo != null ? dlInfo.displayUrl() : "";
+            String downloadHash = dlInfo != null ? dlInfo.expectedHash() : "";
             String indexHash = fileEntry.hash;
 
             // 在 manifest 中查找对应的条目
@@ -201,7 +200,9 @@ public class SyncManager {
             ManifestFile.File manifestFile = manifest.cachedFiles.get(manifestKey);
             if (manifestFile == null) {
                 result.added.add(new ModChange(modName, destPath, downloadUrl, downloadHash, "added"));
-            } else if (!indexHash.equals(manifestFile.hash != null ? manifestFile.hash.toString() : "")) {
+            } else if (invalidateAll
+                || invalidatedPaths.contains(normalizeRelativePath(destPath))
+                || !indexHash.equals(manifestFile.hash != null ? manifestFile.hash.toString() : "")) {
                 result.updated.add(new ModChange(modName, destPath, downloadUrl, downloadHash, "updated",
                     "", "", modName));
             }
@@ -212,13 +213,15 @@ public class SyncManager {
         for (var manifestEntry : manifest.cachedFiles.entrySet()) {
             PackwizFilePath manifestKey = manifestEntry.getKey();
             ManifestFile.File file = manifestEntry.getValue();
-            String relPath = manifestKey.path();
+            String relPath = normalizeRelativePath(manifestKey.path());
             if (file.cachedLocation != null && relPath != null && !indexDestPaths.contains(relPath)) {
                 result.removed.add(new ModChange(
                     relPath, relPath, "", "", "removed"
                 ));
             }
         }
+
+        foldRenamedUpdates(result, indexMap, manifest, packFolder);
 
         return result;
     }
@@ -256,7 +259,7 @@ public class SyncManager {
         // Phase 1: 删除移除的文件
         for (var change : preview.removed) {
             try {
-                Path filePath = packFolder.nioPath().resolve(change.destPath);
+                Path filePath = resolveInsidePack(packFolder, change.destPath);
                 if (Files.deleteIfExists(filePath)) {
                     Log.info("已删除: " + change.destPath);
                 }
@@ -267,6 +270,27 @@ public class SyncManager {
             }
             completed++;
             if (progressCallback != null) progressCallback.accept(completed, "删除: " + change.name);
+        }
+
+        // Phase 1.8: 本地 mods/*.jar 已存在且 hash 正确时跳过下载
+        if (indexFile != null && !downloadTasks.isEmpty()) {
+            var remainingTasks = new ArrayList<ModChange>();
+            for (var change : downloadTasks) {
+                try {
+                    IndexFile.FileEntry entry = findIndexEntry(indexFile, change.destPath, packFolder);
+                    if (entry != null && trySkipExistingModsJar(change, entry, manifest, indexFile, packFolder)) {
+                        addSuccessfulChange(result, change);
+                        completed++;
+                        if (progressCallback != null) progressCallback.accept(completed, "跳过: " + change.name);
+                    } else {
+                        remainingTasks.add(change);
+                    }
+                } catch (Exception e) {
+                    Log.warn("检查本地文件失败，继续下载: " + change.destPath + " - " + e.getMessage());
+                    remainingTasks.add(change);
+                }
+            }
+            downloadTasks = remainingTasks;
         }
 
         // Phase 2: 解析 CurseForge URLs
@@ -284,57 +308,76 @@ public class SyncManager {
                 var failures = CurseForgeSourcer.resolveCfMetadata(cfEntries, packFolder, clientHolder);
                 for (var failure : failures) {
                     Log.warn("CurseForge 解析失败: " + failure.name() + " - " + failure.exception().getMessage());
+                    if (failure.manualOnly() && failure.entry() != null) {
+                        String destPath = relativeDestPath(failure.entry(), packFolder);
+                        ModChange failedChange = removeTaskByDestPath(downloadTasks, destPath);
+                        if (failedChange != null) {
+                            result.failed.add(new ModChange(
+                                failedChange.name, failedChange.destPath, failure.url(), failedChange.hash,
+                                failedChange.changeType, failure.exception().getMessage(), "", ""
+                            ));
+                            completed++;
+                            if (progressCallback != null) progressCallback.accept(completed, "需手动下载: " + failedChange.name);
+                        }
+                    }
                 }
             }
         }
 
         // Phase 3: 并行下载
         var threadPool = Executors.newFixedThreadPool(10);
-        var completionService = new ExecutorCompletionService<ModChange>(threadPool);
+        var completionService = new ExecutorCompletionService<DownloadTaskResult>(threadPool);
 
         for (var change : downloadTasks) {
             completionService.submit(() -> {
-                downloadFile(change, packFolder, indexFile);
-                return change;
+                try {
+                    downloadFile(change, packFolder, indexFile);
+                    return new DownloadTaskResult(change, null);
+                } catch (Exception e) {
+                    return new DownloadTaskResult(change, e);
+                }
             });
         }
 
         for (int i = 0; i < downloadTasks.size(); i++) {
             try {
-                ModChange completedChange = completionService.take().get();
-                // 下载成功
-                IndexFile.FileEntry entry = indexFile != null
-                    ? findIndexEntry(indexFile, completedChange.destPath, packFolder) : null;
-
-                ManifestFile.File manifestFile = new ManifestFile.File();
-                if (entry != null) {
-                    manifestFile.hash = entry.getHashObj(indexFile);
-                    manifestFile.linkedFileHash = entry.linkedFile != null ? entry.linkedFile.getHash() : null;
-                    manifestFile.isOptional = entry.linkedFile != null && entry.linkedFile.option.optional();
-                    manifestFile.onlyOtherSide = false;
+                DownloadTaskResult taskResult = completionService.take().get();
+                ModChange completedChange = taskResult.change();
+                if (taskResult.error() == null) {
+                    IndexFile.FileEntry entry = indexFile != null
+                        ? findIndexEntry(indexFile, completedChange.destPath, packFolder) : null;
+                    try {
+                        putManifestEntry(manifest, entry, indexFile, packFolder, completedChange.destPath);
+                        cleanupRenamedOldPath(manifest, packFolder, completedChange);
+                        String status = completedChange.changeType.equals("added") ? "已新增" : "已更新";
+                        addSuccessfulChange(result, completedChange);
+                        Log.info(status + ": " + completedChange.name);
+                    } catch (IOException e) {
+                        String errorMsg = e.getMessage() != null ? e.getMessage() : "更新清单失败";
+                        result.failed.add(new ModChange(
+                            completedChange.name, completedChange.destPath, completedChange.downloadUrl, completedChange.hash,
+                            completedChange.changeType, errorMsg, "", ""
+                        ));
+                        Log.warn("更新清单失败: " + completedChange.name + " - " + errorMsg);
+                    }
+                } else {
+                    String errorMsg = taskResult.error().getMessage() != null ? taskResult.error().getMessage() : "未知错误";
+                    result.failed.add(new ModChange(
+                        completedChange.name, completedChange.destPath, completedChange.downloadUrl, completedChange.hash,
+                        completedChange.changeType, errorMsg, "", ""
+                    ));
+                    Log.warn("下载失败: " + completedChange.name + " - " + errorMsg);
                 }
-                manifestFile.cachedLocation = new PackwizFilePath(packFolder.nioPath(), completedChange.destPath);
-                manifest.cachedFiles.put(new PackwizFilePath(packFolder.nioPath(), completedChange.destPath), manifestFile);
-
-                String status = completedChange.changeType.equals("added") ? "已新增" : "已更新";
-                result.added.add(completedChange);
-                Log.info(status + ": " + completedChange.name);
-
             } catch (ExecutionException e) {
                 Throwable cause = e.getCause() != null ? e.getCause() : e;
-                ModChange failedTask = downloadTasks.get(i);
                 String errorMsg = cause.getMessage() != null ? cause.getMessage() : "未知错误";
-                result.failed.add(new ModChange(
-                    failedTask.name, failedTask.destPath, failedTask.downloadUrl, failedTask.hash,
-                    failedTask.changeType, errorMsg, "", ""
-                ));
-                Log.warn("下载失败: " + failedTask.name + " - " + errorMsg);
+                Log.warn("下载任务失败: " + errorMsg);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             }
             completed++;
-            if (progressCallback != null) progressCallback.accept(completed, "下载: " + downloadTasks.get(i).name);
+            if (progressCallback != null) progressCallback.accept(completed, "下载完成");
         }
 
         threadPool.shutdown();
@@ -376,9 +419,16 @@ public class SyncManager {
                 indexFile = IndexFile.fromToml(indexSource, indexUri.parent());
             }
             // 读取元数据
-            for (var entry : indexFile.files) {
+            var iterator = indexFile.files.iterator();
+            while (iterator.hasNext()) {
+                var entry = iterator.next();
                 if (entry.metafile) {
-                    try { entry.readLocalMeta(indexFile, packFolder); } catch (Exception ignored) {}
+                    try {
+                        entry.readLocalMeta(indexFile, packFolder);
+                    } catch (Exception e) {
+                        iterator.remove();
+                        Log.warn("读取元数据失败，执行阶段将视为已移除: " + entry.file + " - " + e.getMessage());
+                    }
                 }
             }
             return indexFile;
@@ -395,7 +445,8 @@ public class SyncManager {
         int cleaned = 0;
         Set<String> indexDestPaths = new HashSet<>();
         for (var entry : indexFile.files) {
-            String destPath = entry.getDestURI().rebase(packFolder).path();
+            if (!isEntryInSyncScope(entry, packFolder)) continue;
+            String destPath = relativeDestPath(entry, packFolder);
             indexDestPaths.add(destPath);
         }
 
@@ -404,18 +455,20 @@ public class SyncManager {
             var manifestEntry = iterator.next();
             PackwizFilePath path = manifestEntry.getKey();
             ManifestFile.File file = manifestEntry.getValue();
+            String relPath = normalizeRelativePath(path.path());
 
             // 只清理同步范围内的文件
-            if (!shouldSync(path.path())) continue;
+            if (!shouldSync(relPath)) continue;
 
-            if (file.cachedLocation != null && !indexDestPaths.contains(path.toString())) {
+            if (file.cachedLocation != null && !indexDestPaths.contains(relPath)) {
                 try {
-                    if (Files.deleteIfExists(file.cachedLocation.nioPath())) {
-                        Log.info("已清理 (从索引移除): " + path.path());
+                    Path deletePath = resolveInsidePack(packFolder, relPath);
+                    if (Files.deleteIfExists(deletePath)) {
+                        Log.info("已清理 (从索引移除): " + relPath);
                         cleaned++;
                     }
                 } catch (IOException e) {
-                    Log.warn("清理失败: " + path.path() + " - " + e.getMessage());
+                    Log.warn("清理失败: " + relPath + " - " + e.getMessage());
                 }
                 iterator.remove();
             }
@@ -430,55 +483,38 @@ public class SyncManager {
         // Preserve 检查
         IndexFile.FileEntry entry = indexFile != null ? findIndexEntry(indexFile, change.destPath, packFolder) : null;
         if (entry != null && entry.preserve) {
-            Path destPath = packFolder.nioPath().resolve(change.destPath);
+            Path destPath = resolveInsidePack(packFolder, change.destPath);
             if (Files.exists(destPath)) {
                 Log.info("跳过 (preserve): " + change.destPath);
                 return;
             }
         }
 
-        // 解析下载 URL（CurseForge 条目在 preview 中 URL 为空，需要从 index 解析）
-        String downloadUrl = change.downloadUrl;
-        if ((downloadUrl == null || downloadUrl.isEmpty()) && entry != null) {
-            var dlInfo = getDownloadInfo(entry);
-            if (dlInfo != null) downloadUrl = dlInfo.url();
-        }
-        if (downloadUrl == null || downloadUrl.isEmpty()) {
+        DownloadInfo dlInfo = entry != null ? getDownloadInfo(entry, indexFile) : null;
+        if (dlInfo == null || dlInfo.source() == null) {
             throw new Exception("无法获取下载 URL: " + change.name);
         }
 
-        PackwizPath<?> downloadPath = resolvePackUrl(downloadUrl);
-        InputStream source = downloadPath.source(clientHolder);
-
-        Path destPath = packFolder.nioPath().resolve(change.destPath);
+        Path destPath = resolveInsidePack(packFolder, change.destPath);
         Files.createDirectories(destPath.getParent());
+        Path tempPath = Files.createTempFile(destPath.getParent(), ".packwiz-download-", ".tmp");
 
-        // 流式下载 + hash 校验
-        // 从 entry 获取正确的 hash 和 hashFormat（而非 change.hash）
-        HashFormat hashFormat = HashFormat.SHA256;
-        String expectedHash = "";
-        if (entry != null && entry.linkedFile != null && entry.linkedFile.download != null) {
-            hashFormat = entry.linkedFile.download.hashFormat();
-            expectedHash = entry.linkedFile.download.hash();
-        } else if (entry != null) {
-            hashFormat = entry.effectiveHashFormat(indexFile);
-            expectedHash = entry.hash;
-        }
-
-        Hash.HashingInputStream hashSource = hashFormat.createSource(source);
-        try (hashSource; var out = Files.newOutputStream(destPath)) {
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            while ((bytesRead = hashSource.read(buffer)) != -1) {
-                out.write(buffer, 0, bytesRead);
+        try {
+            InputStream source = dlInfo.source().source(clientHolder);
+            Hash.HashingInputStream hashSource = dlInfo.hashFormat().createSource(source);
+            try (hashSource; var out = Files.newOutputStream(tempPath)) {
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                while ((bytesRead = hashSource.read(buffer)) != -1) {
+                    out.write(buffer, 0, bytesRead);
+                }
             }
-        }
 
-        // Hash 校验
-        String actualHash = HexFormat.of().formatHex(hashSource.getDigest());
-        if (expectedHash != null && !expectedHash.isEmpty() && !actualHash.equals(expectedHash)) {
-            try { Files.deleteIfExists(destPath); } catch (IOException ignored) {}
-            throw new Exception("Hash 不匹配: 期望 " + expectedHash + ", 实际 " + actualHash);
+            verifyDigest(hashSource.getDigest(), dlInfo.hashFormat(), dlInfo.expectedHash());
+            moveReplacing(tempPath, destPath);
+        } catch (Exception e) {
+            try { Files.deleteIfExists(tempPath); } catch (IOException ignored) {}
+            throw e;
         }
     }
 
@@ -501,22 +537,24 @@ public class SyncManager {
     }
 
     /**
-     * 获取文件的下载信息（URL + hash）。
+     * 获取文件的下载信息。
      * CurseForge 条目在 API 解析前返回 null。
      */
-    private DownloadInfo getDownloadInfo(IndexFile.FileEntry entry) {
+    private DownloadInfo getDownloadInfo(IndexFile.FileEntry entry, IndexFile indexFile) {
         if (entry.linkedFile != null) {
+            ExpectedHash expected = expectedDownloadHash(entry, indexFile);
             // CurseForge 解析后的 URL
             var resolved = entry.linkedFile.resolvedUpdateData.get("curseforge");
             if (resolved != null) {
-                String hash = entry.linkedFile.download != null ? entry.linkedFile.download.hash() : entry.hash;
-                return new DownloadInfo(resolved.toString(), hash);
+                return new DownloadInfo(resolved, resolved.toString(), expected.format(), expected.hash());
             }
             // 直接 URL
             if (entry.linkedFile.download != null && entry.linkedFile.download.url() != null) {
                 return new DownloadInfo(
+                    entry.linkedFile.download.url(),
                     entry.linkedFile.download.url().toString(),
-                    entry.linkedFile.download.hash()
+                    expected.format(),
+                    expected.hash()
                 );
             }
             // CurseForge 模式但尚未解析 → 返回 null
@@ -525,33 +563,246 @@ public class SyncManager {
                 return null;
             }
         }
-        // 非 metafile 或无下载信息
-        return null;
+        ExpectedHash expected = expectedDownloadHash(entry, indexFile);
+        return new DownloadInfo(entry.file, entry.file.toString(), expected.format(), expected.hash());
     }
-
-    private record DownloadInfo(String url, String hash) {}
 
     /** 判断文件是否在同步范围内 */
     private boolean shouldSync(String relativePath) {
-        if (relativePath == null || relativePath.isEmpty()) return false;
-        String normalized = relativePath.replace('\\', '/');
-        if (normalized.startsWith("/")) normalized = normalized.substring(1);
+        String normalized = normalizeRelativePath(relativePath);
+        if (normalized == null || normalized.isEmpty() || normalized.contains("../")) return false;
         int slashIdx = normalized.indexOf('/');
         if (slashIdx < 0) return false; // 根目录文件不同步
         String topFolder = normalized.substring(0, slashIdx);
-        return config.getSyncFolders().isEmpty()
-            || config.getSyncFolders().contains("*")
-            || config.getSyncFolders().contains(topFolder);
+        if (InstallerConfig.CONFIG_DIR_NAME.equals(topFolder)) return false;
+        return switch (config.getSyncMode()) {
+            case MODS_ONLY -> "mods".equals(topFolder);
+            case CONFIGURED_FILES -> true;
+        };
+    }
+
+    private boolean isEntryInSyncScope(IndexFile.FileEntry entry, PackwizFilePath packFolder) {
+        if (config.getSyncMode() == InstallerConfig.SyncMode.MODS_ONLY) {
+            if (!entry.metafile) return false;
+            String metaPath = normalizeRelativePath(entry.file.rebase(packFolder).path());
+            if (metaPath == null || !metaPath.startsWith("mods/.index/") || !metaPath.endsWith(".pw.toml")) {
+                return false;
+            }
+            if (entry.linkedFile == null) return true;
+            return isDirectModsJar(relativeDestPath(entry, packFolder));
+        }
+        return shouldSync(relativeDestPath(entry, packFolder));
     }
 
     /** 在 index 中查找对应的 FileEntry */
     private IndexFile.FileEntry findIndexEntry(IndexFile indexFile, String destPath, PackwizFilePath packFolder) {
         if (indexFile == null) return null;
+        String normalizedDest = normalizeRelativePath(destPath);
         for (var entry : indexFile.files) {
-            String entryDest = entry.getDestURI().rebase(packFolder).path();
-            if (entryDest.equals(destPath)) return entry;
+            if (!isEntryInSyncScope(entry, packFolder)) continue;
+            String entryDest = relativeDestPath(entry, packFolder);
+            if (entryDest.equals(normalizedDest)) return entry;
         }
         return null;
+    }
+
+    private String normalizeRelativePath(String path) {
+        if (path == null) return null;
+        String normalized = path.replace('\\', '/');
+        while (normalized.startsWith("/")) normalized = normalized.substring(1);
+        return normalized;
+    }
+
+    private boolean isDirectModsJar(String destPath) {
+        String normalized = normalizeRelativePath(destPath);
+        if (normalized == null || !normalized.startsWith("mods/")) return false;
+        String rest = normalized.substring("mods/".length());
+        return !rest.isEmpty() && !rest.contains("/") && rest.toLowerCase(Locale.ROOT).endsWith(".jar");
+    }
+
+    private String relativeDestPath(IndexFile.FileEntry entry, PackwizFilePath packFolder) {
+        return normalizeRelativePath(entry.getDestURI().rebase(packFolder).path());
+    }
+
+    private Path resolveInsidePack(PackwizFilePath packFolder, String destPath) throws IOException {
+        String normalized = normalizeRelativePath(destPath);
+        if (normalized == null || normalized.isEmpty() || normalized.contains("../") || normalized.equals("..")) {
+            throw new IOException("非法目标路径: " + destPath);
+        }
+        Path base = packFolder.nioPath().toAbsolutePath().normalize();
+        Path resolved = base.resolve(normalized).normalize();
+        if (!resolved.startsWith(base)) {
+            throw new IOException("目标路径位于安装目录外: " + destPath);
+        }
+        return resolved;
+    }
+
+    private ExpectedHash expectedDownloadHash(IndexFile.FileEntry entry, IndexFile indexFile) {
+        if (entry.linkedFile != null && entry.linkedFile.download != null) {
+            return new ExpectedHash(entry.linkedFile.download.hashFormat(), entry.linkedFile.download.hash());
+        }
+        return new ExpectedHash(entry.effectiveHashFormat(indexFile), entry.hash);
+    }
+
+    private void verifyDigest(byte[] digest, HashFormat format, String expectedHash) throws Exception {
+        if (expectedHash == null || expectedHash.isEmpty()) return;
+        Hash<?> expected = format.fromString(expectedHash);
+        Hash<?> actual = new Hash<>(digest, format.encoding());
+        if (!expected.equals(actual)) {
+            throw new Exception("Hash 不匹配: 期望 " + expected + ", 实际 " + actual);
+        }
+    }
+
+    private Hash<?> hashLocalFile(Path path, HashFormat format) throws IOException {
+        try (InputStream in = Files.newInputStream(path);
+             Hash.HashingInputStream hashing = format.createSource(in)) {
+            hashing.transferTo(OutputStream.nullOutputStream());
+            return new Hash<>(hashing.getDigest(), format.encoding());
+        }
+    }
+
+    private boolean trySkipExistingModsJar(ModChange change, IndexFile.FileEntry entry, ManifestFile manifest,
+                                           IndexFile indexFile, PackwizFilePath packFolder) throws Exception {
+        if (!isDirectModsJar(change.destPath) || !shouldSync(change.destPath)) return false;
+        Path localPath = resolveInsidePack(packFolder, change.destPath);
+        if (!Files.exists(localPath)) return false;
+
+        if (entry.preserve) {
+            putManifestEntry(manifest, entry, indexFile, packFolder, change.destPath);
+            Log.info("跳过下载 (preserve): " + change.destPath);
+            return true;
+        }
+
+        ExpectedHash expected = expectedDownloadHash(entry, indexFile);
+        Hash<?> actual = hashLocalFile(localPath, expected.format());
+        Hash<?> expectedHash = expected.format().fromString(expected.hash());
+        if (expectedHash.equals(actual)) {
+            putManifestEntry(manifest, entry, indexFile, packFolder, change.destPath);
+            Log.info("跳过下载，文件已存在且 Hash 正确: " + change.destPath);
+            return true;
+        }
+        Log.info("本地文件 Hash 不匹配，将重新下载: " + change.destPath);
+        return false;
+    }
+
+    private void foldRenamedUpdates(SyncResult result, Map<String, IndexFile.FileEntry> indexMap,
+                                    ManifestFile manifest, PackwizFilePath packFolder) {
+        var addedIterator = result.added.iterator();
+        while (addedIterator.hasNext()) {
+            ModChange added = addedIterator.next();
+            IndexFile.FileEntry addedEntry = indexMap.get(normalizeRelativePath(added.destPath));
+            if (addedEntry == null || addedEntry.hash == null) continue;
+            String addedMetaPath = metaFilePath(addedEntry, packFolder);
+
+            ModChange matchingRemoved = null;
+            for (ModChange removed : result.removed) {
+                ManifestFile.File oldFile = manifest.cachedFiles.get(new PackwizFilePath(
+                    packFolder.nioPath(), removed.destPath
+                ));
+                String oldMetaPath = oldFile != null && oldFile.metaFile != null
+                    ? normalizeRelativePath(oldFile.metaFile.path()) : null;
+                String oldHash = oldFile != null && oldFile.hash != null ? oldFile.hash.toString() : null;
+                if ((addedMetaPath != null && addedMetaPath.equals(oldMetaPath))
+                    || (oldMetaPath == null && addedEntry.hash.equals(oldHash))
+                    || (oldMetaPath == null && sameMetaFileBasename(addedMetaPath, removed.destPath))) {
+                    matchingRemoved = removed;
+                    break;
+                }
+            }
+            if (matchingRemoved == null) continue;
+
+            addedIterator.remove();
+            result.removed.remove(matchingRemoved);
+            result.updated.add(new ModChange(
+                added.name, added.destPath, added.downloadUrl, added.hash,
+                "updated", "", matchingRemoved.destPath, added.destPath
+            ));
+        }
+    }
+
+    private String metaFilePath(IndexFile.FileEntry entry, PackwizFilePath packFolder) {
+        if (entry == null || !entry.metafile || entry.file == null) return null;
+        return normalizeRelativePath(entry.file.rebase(packFolder).path());
+    }
+
+    private boolean sameMetaFileBasename(String metaPath, String removedDestPath) {
+        String metaBase = fileStem(metaPath, ".pw.toml");
+        String oldJarBase = fileStem(removedDestPath, ".jar");
+        return metaBase != null && oldJarBase != null
+            && (oldJarBase.equals(metaBase) || oldJarBase.startsWith(metaBase + "-"));
+    }
+
+    private String fileStem(String path, String suffix) {
+        String normalized = normalizeRelativePath(path);
+        if (normalized == null) return null;
+        int slash = normalized.lastIndexOf('/');
+        String name = slash >= 0 ? normalized.substring(slash + 1) : normalized;
+        String lowerName = name.toLowerCase(Locale.ROOT);
+        String lowerSuffix = suffix.toLowerCase(Locale.ROOT);
+        if (!lowerName.endsWith(lowerSuffix)) return null;
+        return name.substring(0, name.length() - suffix.length()).toLowerCase(Locale.ROOT);
+    }
+
+    private void putManifestEntry(ManifestFile manifest, IndexFile.FileEntry entry, IndexFile indexFile,
+                                  PackwizFilePath packFolder, String destPath) throws IOException {
+        PackwizFilePath key = new PackwizFilePath(packFolder.nioPath(), destPath);
+        ManifestFile.File previous = manifest.cachedFiles.get(key);
+        ManifestFile.File manifestFile = new ManifestFile.File();
+        if (entry != null) {
+            manifestFile.hash = entry.getHashObj(indexFile);
+            manifestFile.linkedFileHash = entry.linkedFile != null && entry.linkedFile.download != null ? entry.linkedFile.getHash() : null;
+            String metaPath = metaFilePath(entry, packFolder);
+            manifestFile.metaFile = metaPath != null ? new PackwizFilePath(packFolder.nioPath(), metaPath) : null;
+            manifestFile.isOptional = entry.linkedFile != null ? entry.linkedFile.option.optional() : entry.optional;
+            manifestFile.optionValue = previous != null ? previous.optionValue
+                : entry.linkedFile != null ? entry.linkedFile.option.defaultValue() : true;
+            manifestFile.onlyOtherSide = false;
+        }
+        resolveInsidePack(packFolder, destPath);
+        manifestFile.cachedLocation = key;
+        manifest.cachedFiles.put(key, manifestFile);
+    }
+
+    private void cleanupRenamedOldPath(ManifestFile manifest, PackwizFilePath packFolder, ModChange change) {
+        if (!"updated".equals(change.changeType) || change.oldVersion == null || change.oldVersion.isBlank()) return;
+        String oldPath = normalizeRelativePath(change.oldVersion);
+        String newPath = normalizeRelativePath(change.destPath);
+        if (oldPath == null || oldPath.equals(newPath)) return;
+        try {
+            Files.deleteIfExists(resolveInsidePack(packFolder, oldPath));
+        } catch (IOException e) {
+            Log.warn("删除旧版本文件失败: " + oldPath + " - " + e.getMessage());
+        }
+        manifest.cachedFiles.remove(new PackwizFilePath(packFolder.nioPath(), oldPath));
+    }
+
+    private void addSuccessfulChange(SyncResult result, ModChange change) {
+        if ("updated".equals(change.changeType)) {
+            result.updated.add(change);
+        } else {
+            result.added.add(change);
+        }
+    }
+
+    private ModChange removeTaskByDestPath(List<ModChange> tasks, String destPath) {
+        String normalized = normalizeRelativePath(destPath);
+        var iterator = tasks.iterator();
+        while (iterator.hasNext()) {
+            ModChange change = iterator.next();
+            if (Objects.equals(normalizeRelativePath(change.destPath), normalized)) {
+                iterator.remove();
+                return change;
+            }
+        }
+        return null;
+    }
+
+    private void moveReplacing(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        }
     }
 
     public void close() {

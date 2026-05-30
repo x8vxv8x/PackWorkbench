@@ -19,6 +19,7 @@ public abstract class PackwizPath<T extends PackwizPath<T>> {
         if (path != null) {
             if (path.contains("\0")) throw new RequestException.Validation.PathContainsNUL(path);
             String normalized = path.replace('\\', '/');
+            boolean folderPath = normalized.endsWith("/") || normalized.endsWith("\\");
             String[] split = normalized.split("/");
             List<String> canonicalized = new ArrayList<>();
 
@@ -55,6 +56,9 @@ public abstract class PackwizPath<T extends PackwizPath<T>> {
                 for (int i = canonicalized.size() - 1; i >= 0; i--) {
                     if (i < canonicalized.size() - 1) sb.append('/');
                     sb.append(canonicalized.get(i));
+                }
+                if (folderPath && sb.length() > 0 && sb.charAt(sb.length() - 1) != '/') {
+                    sb.append('/');
                 }
                 this.path = sb.toString();
             }
