@@ -1,6 +1,7 @@
 package link.infra.packwiz.installer.metadata.curseforge;
 
 import com.google.gson.Gson;
+import com.google.gson.annotations.SerializedName;
 import link.infra.packwiz.installer.metadata.IndexFile;
 import link.infra.packwiz.installer.metadata.ModFile;
 import link.infra.packwiz.installer.metadata.hash.HashFormat;
@@ -577,6 +578,7 @@ public class CurseForgeSourcer {
         String fileName;
         String displayName;
         int releaseType = RELEASE;
+        @SerializedName("fileFingerprint")
         long fingerprint;
         List<String> gameVersions = new ArrayList<>();
         List<CfHash> hashes = new ArrayList<>();

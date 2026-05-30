@@ -217,10 +217,13 @@ public class WorkbenchWindow extends JFrame {
         save.addActionListener(e -> saveCompatJarSettings());
         JButton refresh = new JButton("刷新");
         refresh.addActionListener(e -> reloadCompatJars());
+        JButton detect = new JButton("转为 CF 索引");
+        detect.addActionListener(e -> detectSelectedLocalJarFolder());
         var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
         buttons.add(browse);
         buttons.add(save);
         buttons.add(refresh);
+        buttons.add(detect);
         var gbc = new GridBagConstraints();
         gbc.gridx = 1;
         gbc.gridy = 2;
@@ -353,22 +356,16 @@ public class WorkbenchWindow extends JFrame {
 
     private JPopupMenu localJarMenu(JTable table) {
         var menu = new JPopupMenu();
-        var detect = new JMenuItem("检测并转为 CurseForge 索引");
-        detect.addActionListener(e -> detectSelectedLocalJarFolder());
         var delete = new JMenuItem("删除文件");
         delete.addActionListener(e -> deleteSelectedLocalJar(table));
         menu.addPopupMenuListener(new javax.swing.event.PopupMenuListener() {
             @Override public void popupMenuWillBecomeVisible(javax.swing.event.PopupMenuEvent e) {
-                boolean selected = selectedLocalJar(table) != null;
-                detect.setEnabled(selected);
-                delete.setEnabled(selected);
+                delete.setEnabled(selectedLocalJar(table) != null);
             }
 
             @Override public void popupMenuWillBecomeInvisible(javax.swing.event.PopupMenuEvent e) {}
             @Override public void popupMenuCanceled(javax.swing.event.PopupMenuEvent e) {}
         });
-        menu.add(detect);
-        menu.addSeparator();
         menu.add(delete);
         return menu;
     }

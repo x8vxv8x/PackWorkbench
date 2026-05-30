@@ -81,8 +81,13 @@ public class CurseForgeProjectService {
         try (var holder = new CloseableClientHolder()) {
             var report = CurseForgeSourcer.matchFingerprints(fingerprints, holder.client());
             for (var match : report.matches()) {
+                Path file = fingerprints.get(match.fingerprint());
+                if (file == null && match.fingerprint() == 0) {
+                    file = findMatchedFileByFileId(fingerprints, report.matches(), match.fileId());
+                }
                 if (installed.contains(match.projectId())) {
                     skippedInstalled++;
+                    if (deleteMatchedFiles && file != null) Files.deleteIfExists(file);
                     continue;
                 }
                 written.add(new MetadataWriter(repository).writeCurseForgeMetadata(
@@ -98,13 +103,23 @@ public class CurseForgeProjectService {
                 ));
                 installed.add(match.projectId());
                 if (deleteMatchedFiles) {
-                    Path file = fingerprints.get(match.fingerprint());
                     if (file != null) Files.deleteIfExists(file);
                 }
             }
             new IndexRefresher(repository).refreshAndWrite();
             return new DetectReport(fingerprints.size(), written.size(), skippedInstalled, report.unmatched());
         }
+    }
+
+    private Path findMatchedFileByFileId(Map<Long, Path> fingerprints,
+                                         List<CurseForgeSourcer.FingerprintMatch> matches,
+                                         int fileId) {
+        for (var match : matches) {
+            if (match.fileId() == fileId && fingerprints.containsKey(match.fingerprint())) {
+                return fingerprints.get(match.fingerprint());
+            }
+        }
+        return null;
     }
 
     public List<UpdateResult> checkAllUpdates() throws Exception {
