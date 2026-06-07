@@ -3,8 +3,8 @@ package link.infra.packwiz.installer.ui.gui;
 import com.formdev.flatlaf.FlatClientProperties;
 import link.infra.packwiz.installer.config.InstallerConfig;
 import link.infra.packwiz.installer.exporter.CurseForgeExportBuilder;
-import link.infra.packwiz.installer.metadata.DownloadMode;
 import link.infra.packwiz.installer.metadata.IndexFile;
+import link.infra.packwiz.installer.metadata.ManifestFile;
 import link.infra.packwiz.installer.metadata.ModFile;
 import link.infra.packwiz.installer.metadata.PackFile;
 import link.infra.packwiz.installer.metadata.curseforge.CurseForgeUpdateData;
@@ -16,11 +16,14 @@ import link.infra.packwiz.installer.project.ModMetadataEditor;
 import link.infra.packwiz.installer.project.PackInitializer;
 import link.infra.packwiz.installer.project.PackRepository;
 import link.infra.packwiz.installer.sync.SyncManager;
+import link.infra.packwiz.installer.target.path.PackwizFilePath;
 import link.infra.packwiz.installer.util.Log;
 
 import javax.swing.*;
 import javax.swing.table.AbstractTableModel;
 import java.awt.*;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.io.File;
@@ -84,7 +87,13 @@ public class WorkbenchWindow extends JFrame {
         initMinecraftBox.setEditable(true);
         initLoaderVersionBox.setEditable(true);
 
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                shutdown();
+            }
+        });
         setMinimumSize(new Dimension(1120, 720));
         setSize(1280, 780);
         setLocationRelativeTo(null);
@@ -153,10 +162,10 @@ public class WorkbenchWindow extends JFrame {
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         table.setFillsViewportHeight(true);
         table.putClientProperty(FlatClientProperties.STYLE, "showHorizontalLines: true; showVerticalLines: false");
-        for (int column : List.of(2, 3)) {
+        for (int column : List.of(2, 3, 4, 5)) {
             table.getColumnModel().getColumn(column).setMinWidth(56);
-            table.getColumnModel().getColumn(column).setPreferredWidth(64);
-            table.getColumnModel().getColumn(column).setMaxWidth(76);
+            table.getColumnModel().getColumn(column).setPreferredWidth(column == 3 ? 90 : 64);
+            table.getColumnModel().getColumn(column).setMaxWidth(column == 3 ? 120 : 76);
         }
         table.setComponentPopupMenu(assetMenu(table, model));
         table.addMouseListener(new MouseAdapter() {
@@ -180,16 +189,23 @@ public class WorkbenchWindow extends JFrame {
     }
 
     private JTable createLocalJarTable() {
-        JTable table = new JTable(localJarsModel);
+        return createLocalJarTable(localJarsModel);
+    }
+
+    private JTable createLocalJarTable(LocalJarTableModel model) {
+        JTable table = new JTable(model);
         table.setAutoCreateRowSorter(true);
         table.setRowHeight(28);
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         table.setFillsViewportHeight(true);
         table.putClientProperty(FlatClientProperties.STYLE, "showHorizontalLines: true; showVerticalLines: false");
-        table.getColumnModel().getColumn(2).setMinWidth(72);
-        table.getColumnModel().getColumn(2).setPreferredWidth(90);
-        table.getColumnModel().getColumn(2).setMaxWidth(120);
-        table.setComponentPopupMenu(localJarMenu(table));
+        table.getColumnModel().getColumn(1).setMinWidth(56);
+        table.getColumnModel().getColumn(1).setPreferredWidth(64);
+        table.getColumnModel().getColumn(1).setMaxWidth(72);
+        table.getColumnModel().getColumn(3).setMinWidth(72);
+        table.getColumnModel().getColumn(3).setPreferredWidth(90);
+        table.getColumnModel().getColumn(3).setMaxWidth(120);
+        table.setComponentPopupMenu(localJarMenu(table, model));
         table.addMouseListener(new MouseAdapter() {
             @Override public void mousePressed(MouseEvent e) { selectPopupRow(e); }
             @Override public void mouseReleased(MouseEvent e) { selectPopupRow(e); }
@@ -274,12 +290,9 @@ public class WorkbenchWindow extends JFrame {
         addRow(panel, "预览", new JScrollPane(resolvedPreview));
         JButton parse = new JButton("解析");
         parse.addActionListener(e -> previewLink());
-        JButton add = new JButton("添加到 packwiz");
-        add.addActionListener(e -> addLink());
+        JButton add = new JButton("添加");
+        add.addActionListener(e -> addAsset());
         addRow(panel, "", buttonLine(parse, add));
-        JButton addProject = new JButton("按项目添加最新兼容版");
-        addProject.addActionListener(e -> addCurseForgeProject());
-        addRow(panel, "", addProject);
         return new JScrollPane(panel);
     }
 
@@ -322,6 +335,10 @@ public class WorkbenchWindow extends JFrame {
         var menu = new JPopupMenu();
         var delete = new JMenuItem("删除索引");
         delete.addActionListener(e -> deleteSelectedIndex(table, model));
+        var deleteFile = new JMenuItem("删除文件");
+        deleteFile.addActionListener(e -> deleteSelectedAssetFile(table, model));
+        var toggle = new JMenuItem("禁用/解禁");
+        toggle.addActionListener(e -> toggleSelectedAssetFile(table, model));
         var pin = new JMenuItem("锁定更新");
         pin.addActionListener(e -> pinSelected(table, model, true));
         var unpin = new JMenuItem("解除锁定");
@@ -339,11 +356,17 @@ public class WorkbenchWindow extends JFrame {
                 check.setEnabled(curseForge);
                 apply.setEnabled(curseForge);
                 delete.setEnabled(row != null);
+                deleteFile.setEnabled(row != null && row.actualFile() != null);
+                toggle.setEnabled(row != null && row.type().equals("mod") && row.actualFile() != null && row.toggleTarget() != null);
+                if (row != null) toggle.setText(row.disabled() ? "解禁" : "禁用");
             }
 
             @Override public void popupMenuWillBecomeInvisible(javax.swing.event.PopupMenuEvent e) {}
             @Override public void popupMenuCanceled(javax.swing.event.PopupMenuEvent e) {}
         });
+        menu.add(toggle);
+        menu.add(deleteFile);
+        menu.addSeparator();
         menu.add(delete);
         menu.addSeparator();
         menu.add(pin);
@@ -354,19 +377,25 @@ public class WorkbenchWindow extends JFrame {
         return menu;
     }
 
-    private JPopupMenu localJarMenu(JTable table) {
+    private JPopupMenu localJarMenu(JTable table, LocalJarTableModel model) {
         var menu = new JPopupMenu();
         var delete = new JMenuItem("删除文件");
-        delete.addActionListener(e -> deleteSelectedLocalJar(table));
+        delete.addActionListener(e -> deleteSelectedLocalJar(table, model));
+        var toggle = new JMenuItem("禁用/解禁");
+        toggle.addActionListener(e -> toggleSelectedLocalJar(table, model));
         menu.addPopupMenuListener(new javax.swing.event.PopupMenuListener() {
             @Override public void popupMenuWillBecomeVisible(javax.swing.event.PopupMenuEvent e) {
-                delete.setEnabled(selectedLocalJar(table) != null);
+                LocalJarRow row = selectedLocalJar(table, model);
+                delete.setEnabled(row != null);
+                toggle.setEnabled(row != null && row.toggleTarget() != null);
+                if (row != null) toggle.setText(row.disabled() ? "解禁" : "禁用");
             }
 
             @Override public void popupMenuWillBecomeInvisible(javax.swing.event.PopupMenuEvent e) {}
             @Override public void popupMenuCanceled(javax.swing.event.PopupMenuEvent e) {}
         });
         menu.add(delete);
+        menu.add(toggle);
         return menu;
     }
 
@@ -477,17 +506,7 @@ public class WorkbenchWindow extends JFrame {
 
     private void reloadCompatJars() {
         try {
-            var rows = new ArrayList<LocalJarRow>();
-            Path folder = resolveCompatJarFolder();
-            if (Files.isDirectory(folder)) {
-                try (var stream = Files.list(folder)) {
-                    stream.filter(Files::isRegularFile)
-                        .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
-                        .sorted((a, b) -> a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString()))
-                        .forEach(path -> rows.add(LocalJarRow.from(projectRoot, path)));
-                }
-            }
-            localJarsModel.setRows(rows);
+            localJarsModel.setRows(scanLocalJarRows(resolveCompatJarFolder()));
             if (assetTabs.getTabCount() > 3) {
                 assetTabs.setTitleAt(3, config.getCompatJarTabName() + " (" + localJarsModel.getRowCount() + ")");
             }
@@ -497,9 +516,27 @@ public class WorkbenchWindow extends JFrame {
         }
     }
 
+    private List<LocalJarRow> scanLocalJarRows(Path folder) throws Exception {
+        var rows = new ArrayList<LocalJarRow>();
+        if (Files.isDirectory(folder)) {
+            try (var stream = Files.list(folder)) {
+                stream.filter(Files::isRegularFile)
+                    .filter(WorkbenchWindow::isLocalModFile)
+                    .sorted((a, b) -> a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString()))
+                    .forEach(path -> rows.add(LocalJarRow.from(projectRoot, path)));
+            }
+        }
+        return rows;
+    }
+
+    private static boolean isLocalModFile(Path path) {
+        String lower = path.getFileName().toString().toLowerCase(Locale.ROOT);
+        return lower.endsWith(".jar") || lower.endsWith(".jar.disabled") || lower.endsWith(".disabled");
+    }
+
     private List<AssetRow> toRows(IndexFile index) {
         var rows = new ArrayList<AssetRow>();
-        for (var entry : index.files) rows.add(AssetRow.from(entry, repository.rootPath()));
+        for (var entry : index.files) rows.add(AssetRow.from(entry, repository.rootPath(), projectRoot));
         return rows;
     }
 
@@ -513,41 +550,39 @@ public class WorkbenchWindow extends JFrame {
 
     private void previewLink() {
         runBackground("解析链接", () -> {
-            var resolved = resolveLink();
-            SwingUtilities.invokeLater(() -> resolvedPreview.setText(formatResolved(resolved)));
+            if (shouldAddAsUrl()) {
+                var resolved = resolveLink(LinkMetadataResolver.SourcePreference.URL);
+                SwingUtilities.invokeLater(() -> resolvedPreview.setText(formatResolved(resolved)));
+            } else {
+                var resolved = new CurseForgeProjectService(repository).resolveProjectPreview(addLinkField.getText().trim());
+                SwingUtilities.invokeLater(() -> resolvedPreview.setText(formatCurseForgeProject(resolved)));
+            }
         });
     }
 
-    private void addLink() {
+    private void addAsset() {
+        if (shouldAddAsUrl()) {
+            addUrl();
+        } else {
+            addCurseForgeProject();
+        }
+    }
+
+    private void addUrl() {
         runBackground("添加链接", () -> {
-            var resolved = resolveLink();
+            var resolved = resolveLink(LinkMetadataResolver.SourcePreference.URL);
             var writer = new MetadataWriter(repository);
-            Path meta;
-            if (resolved.type() == LinkMetadataResolver.SourceType.CURSEFORGE) {
-                meta = writer.writeCurseForgeMetadata(
-                    resolved.category(),
-                    resolved.name(),
-                    resolved.filename(),
-                    resolved.curseForgeProjectId(),
-                    resolved.curseForgeFileId(),
-                    resolved.hash(),
-                    String.valueOf(addSideBox.getSelectedItem()),
-                    addOptionalBox.isSelected(),
-                    addDefaultBox.isSelected()
-                );
-            } else {
-                meta = writer.writeUrlMetadata(
-                    resolved.category(),
-                    resolved.name(),
-                    resolved.filename(),
-                    resolved.url(),
-                    resolved.hashFormat(),
-                    resolved.hash(),
-                    String.valueOf(addSideBox.getSelectedItem()),
-                    addOptionalBox.isSelected(),
-                    addDefaultBox.isSelected()
-                );
-            }
+            Path meta = writer.writeUrlMetadata(
+                resolved.category(),
+                resolved.name(),
+                resolved.filename(),
+                resolved.url(),
+                resolved.hashFormat(),
+                resolved.hash(),
+                String.valueOf(addSideBox.getSelectedItem()),
+                addOptionalBox.isSelected(),
+                addDefaultBox.isSelected()
+            );
             Log.info("已写入: " + meta);
             new IndexRefresher(repository).refreshAndWrite();
             SwingUtilities.invokeLater(() -> {
@@ -649,8 +684,38 @@ public class WorkbenchWindow extends JFrame {
         });
     }
 
-    private void deleteSelectedLocalJar(JTable table) {
-        LocalJarRow row = selectedLocalJar(table);
+    private void deleteSelectedAssetFile(JTable table, AssetTableModel model) {
+        AssetRow row = selectedRow(table, model);
+        if (row == null || row.actualFile() == null) return;
+        int confirm = JOptionPane.showConfirmDialog(this,
+            "删除本地文件？\n" + row.actualPath(),
+            "删除文件", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (confirm != JOptionPane.OK_OPTION) return;
+        runBackground("删除本地文件", () -> {
+            Files.deleteIfExists(row.actualFile());
+            removeLocalManifestState(row.actualFile());
+            SwingUtilities.invokeLater(this::reloadProject);
+        });
+    }
+
+    private void toggleSelectedAssetFile(JTable table, AssetTableModel model) {
+        AssetRow row = selectedRow(table, model);
+        if (row == null || row.actualFile() == null || row.toggleTarget() == null) return;
+        if (Files.exists(row.toggleTarget())) {
+            JOptionPane.showMessageDialog(this,
+                "目标文件已存在:\n" + row.toggleTarget(),
+                row.disabled() ? "解禁" : "禁用", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        runBackground(row.disabled() ? "解禁本地 mod" : "禁用本地 mod", () -> {
+            Files.move(row.actualFile(), row.toggleTarget());
+            persistLocalDisabledState(row.actualFile(), row.toggleTarget(), !row.disabled());
+            SwingUtilities.invokeLater(this::reloadProject);
+        });
+    }
+
+    private void deleteSelectedLocalJar(JTable table, LocalJarTableModel model) {
+        LocalJarRow row = selectedLocalJar(table, model);
         if (row == null) return;
         int confirm = JOptionPane.showConfirmDialog(this,
             "删除本地 jar 文件？\n" + row.path(),
@@ -658,6 +723,25 @@ public class WorkbenchWindow extends JFrame {
         if (confirm != JOptionPane.OK_OPTION) return;
         runBackground("删除本地 jar", () -> {
             Files.deleteIfExists(row.file());
+            removeLocalManifestState(row.file());
+            SwingUtilities.invokeLater(this::reloadCompatJars);
+        });
+    }
+
+    private void toggleSelectedLocalJar(JTable table, LocalJarTableModel model) {
+        LocalJarRow row = selectedLocalJar(table, model);
+        if (row == null || row.toggleTarget() == null) return;
+        Path source = row.file();
+        Path target = row.toggleTarget();
+        if (Files.exists(target)) {
+            JOptionPane.showMessageDialog(this,
+                "目标文件已存在:\n" + target,
+                row.disabled() ? "解禁" : "禁用", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        runBackground(row.disabled() ? "解禁本地 mod" : "禁用本地 mod", () -> {
+            Files.move(source, target);
+            persistLocalDisabledState(source, target, !row.disabled());
             SwingUtilities.invokeLater(this::reloadCompatJars);
         });
     }
@@ -684,16 +768,29 @@ public class WorkbenchWindow extends JFrame {
 
     private void checkAllUpdates() {
         runBackground("批量检查更新", () -> {
-            var results = new CurseForgeProjectService(repository).checkAllUpdates();
-            StringBuilder sb = new StringBuilder();
-            int available = 0;
-            for (var result : results) {
-                if (result.updateAvailable()) available++;
-                sb.append(result.name()).append(": ").append(result.message()).append('\n');
-            }
-            if (sb.isEmpty()) sb.append("没有可检查的 CurseForge 条目。");
-            String title = "批量检查更新 - 可更新 " + available + " 个";
-            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this, sb.toString(), title, JOptionPane.INFORMATION_MESSAGE));
+            var service = new CurseForgeProjectService(repository);
+            var results = service.checkAllUpdates();
+            SwingUtilities.invokeLater(() -> showBatchUpdateWindow(results));
+        });
+    }
+
+    private void showBatchUpdateWindow(List<CurseForgeProjectService.UpdateResult> results) {
+        if (results.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "没有可检查的 CurseForge 条目。", "批量检查更新", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        boolean hasUpdates = results.stream().anyMatch(CurseForgeProjectService.UpdateResult::updateAvailable);
+        if (!hasUpdates) {
+            JOptionPane.showMessageDialog(this, "没有可更新的 CurseForge 条目。", "批量检查更新", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        var dialog = new UpdateSelectionWindow(this, results);
+        dialog.setVisible(true);
+        var selected = dialog.selectedUpdates();
+        if (selected.isEmpty()) return;
+        runBackground("批量应用更新", () -> {
+            new CurseForgeProjectService(repository).applyUpdates(selected);
+            SwingUtilities.invokeLater(this::reloadProject);
         });
     }
 
@@ -703,10 +800,100 @@ public class WorkbenchWindow extends JFrame {
         return model.rowAt(table.convertRowIndexToModel(row));
     }
 
-    private LocalJarRow selectedLocalJar(JTable table) {
+    private LocalJarRow selectedLocalJar(JTable table, LocalJarTableModel model) {
         int row = table.getSelectedRow();
         if (row < 0) return null;
-        return localJarsModel.rowAt(table.convertRowIndexToModel(row));
+        return model.rowAt(table.convertRowIndexToModel(row));
+    }
+
+    private void persistLocalDisabledState(Path oldPath, Path newPath, boolean disabled) throws Exception {
+        String oldRel = projectRelativePathOrNull(oldPath);
+        String newRel = projectRelativePathOrNull(newPath);
+        if (oldRel == null || newRel == null) return;
+
+        InstallerConfig.ensureConfigDir(projectRoot);
+        PackwizFilePath packFolder = new PackwizFilePath(projectRoot);
+        ManifestFile manifest = ManifestFile.load(InstallerConfig.getManifestFile(projectRoot), packFolder);
+        String enabledRel = disabled ? stripDisabledSuffix(newRel) : newRel;
+        String disabledRel = appendDisabledSuffix(enabledRel);
+        ManifestFile.File file = findLocalManifestFile(manifest, packFolder, oldRel, newRel, enabledRel, disabledRel);
+        if (file == null) return;
+        file.disabled = disabled;
+        file.cachedLocation = new PackwizFilePath(packFolder.nioPath(), newRel);
+
+        removeLocalManifestKeys(manifest, packFolder, oldRel, newRel, disabledRel);
+        manifest.cachedFiles.put(new PackwizFilePath(packFolder.nioPath(), enabledRel), file);
+        manifest.save(InstallerConfig.getManifestFile(projectRoot), packFolder);
+    }
+
+    private void removeLocalManifestState(Path filePath) throws Exception {
+        String rel = projectRelativePathOrNull(filePath);
+        if (rel == null) return;
+        PackwizFilePath packFolder = new PackwizFilePath(projectRoot);
+        Path manifestPath = InstallerConfig.getManifestFile(projectRoot);
+        if (!Files.exists(manifestPath)) return;
+
+        ManifestFile manifest = ManifestFile.load(manifestPath, packFolder);
+        String enabledRel = stripDisabledSuffix(rel);
+        String disabledRel = appendDisabledSuffix(enabledRel);
+        removeLocalManifestKeys(manifest, packFolder, rel, enabledRel, disabledRel);
+        manifest.save(manifestPath, packFolder);
+    }
+
+    private ManifestFile.File findLocalManifestFile(ManifestFile manifest, PackwizFilePath packFolder, String... relPaths) {
+        for (String relPath : relPaths) {
+            ManifestFile.File file = manifest.cachedFiles.get(new PackwizFilePath(packFolder.nioPath(), relPath));
+            if (file != null) return file;
+        }
+        var candidates = new java.util.HashSet<String>();
+        for (String relPath : relPaths) candidates.add(normalizeRelativePath(relPath));
+        for (var entry : manifest.cachedFiles.entrySet()) {
+            ManifestFile.File file = entry.getValue();
+            String cached = file.cachedLocation != null ? normalizeRelativePath(file.cachedLocation.path()) : null;
+            if (cached != null && candidates.contains(cached)) return file;
+        }
+        return null;
+    }
+
+    private void removeLocalManifestKeys(ManifestFile manifest, PackwizFilePath packFolder, String... relPaths) {
+        var candidates = new java.util.HashSet<String>();
+        for (String relPath : relPaths) {
+            String normalized = normalizeRelativePath(relPath);
+            if (normalized == null || normalized.isBlank()) continue;
+            candidates.add(normalized);
+            manifest.cachedFiles.remove(new PackwizFilePath(packFolder.nioPath(), normalized));
+        }
+        manifest.cachedFiles.entrySet().removeIf(entry -> {
+            ManifestFile.File file = entry.getValue();
+            String key = normalizeRelativePath(entry.getKey().path());
+            String cached = file.cachedLocation != null ? normalizeRelativePath(file.cachedLocation.path()) : null;
+            return candidates.contains(key) || candidates.contains(cached);
+        });
+    }
+
+    private String projectRelativePathOrNull(Path path) {
+        Path absolute = path.toAbsolutePath().normalize();
+        if (!absolute.startsWith(projectRoot)) return null;
+        return normalizeRelativePath(projectRoot.relativize(absolute).toString());
+    }
+
+    private static String normalizeRelativePath(String path) {
+        if (path == null) return null;
+        return path.replace(File.separatorChar, '/').replace('\\', '/');
+    }
+
+    private static String stripDisabledSuffix(String path) {
+        String normalized = normalizeRelativePath(path);
+        if (normalized == null) return null;
+        return normalized.toLowerCase(Locale.ROOT).endsWith(".disabled")
+            ? normalized.substring(0, normalized.length() - ".disabled".length())
+            : normalized;
+    }
+
+    private static String appendDisabledSuffix(String path) {
+        String normalized = normalizeRelativePath(path);
+        if (normalized == null) return null;
+        return normalized.toLowerCase(Locale.ROOT).endsWith(".disabled") ? normalized : normalized + ".disabled";
     }
 
     private void chooseCompatJarFolder() {
@@ -754,18 +941,18 @@ public class WorkbenchWindow extends JFrame {
         });
     }
 
-    private LinkMetadataResolver.ResolvedLink resolveLink() throws Exception {
+    private LinkMetadataResolver.ResolvedLink resolveLink(LinkMetadataResolver.SourcePreference preference) throws Exception {
         String category = LinkMetadataResolver.inferCategory(addLinkField.getText(), String.valueOf(addCategoryBox.getSelectedItem()));
         addCategoryBox.setSelectedItem(category);
-        return new LinkMetadataResolver().resolve(addLinkField.getText(), category, selectedSourcePreference());
+        return new LinkMetadataResolver().resolve(addLinkField.getText(), category, preference);
     }
 
-    private LinkMetadataResolver.SourcePreference selectedSourcePreference() {
-        return switch (String.valueOf(addSourceBox.getSelectedItem())) {
-            case "CurseForge" -> LinkMetadataResolver.SourcePreference.CURSEFORGE;
-            case "URL" -> LinkMetadataResolver.SourcePreference.URL;
-            default -> LinkMetadataResolver.SourcePreference.AUTO;
-        };
+    private boolean shouldAddAsUrl() {
+        String preference = String.valueOf(addSourceBox.getSelectedItem());
+        String input = addLinkField.getText() == null ? "" : addLinkField.getText().trim().toLowerCase(Locale.ROOT);
+        if ("URL".equals(preference)) return true;
+        if ("CurseForge".equals(preference)) return false;
+        return input.matches("^(https?|file):.*") && !input.contains("curseforge.com");
     }
 
     private String formatResolved(LinkMetadataResolver.ResolvedLink resolved) {
@@ -777,6 +964,15 @@ public class WorkbenchWindow extends JFrame {
             + (resolved.type() == LinkMetadataResolver.SourceType.CURSEFORGE
                 ? "CurseForge: " + resolved.curseForgeProjectId() + " / " + resolved.curseForgeFileId() + "\n"
                 : "URL: " + resolved.url() + "\n");
+    }
+
+    private String formatCurseForgeProject(link.infra.packwiz.installer.metadata.curseforge.CurseForgeSourcer.CurseForgeProjectFile resolved) {
+        return "类型: CurseForge 项目\n"
+            + "名称: " + resolved.name() + "\n"
+            + "文件: " + resolved.filename() + "\n"
+            + "Hash: sha1 " + resolved.sha1() + "\n"
+            + "CurseForge: " + resolved.projectId() + " / " + resolved.fileId() + "\n"
+            + "依赖: " + resolved.requiredDependencies().size() + "\n";
     }
 
     private void startSync() {
@@ -832,7 +1028,7 @@ public class WorkbenchWindow extends JFrame {
 
     private void runBackground(String title, ThrowingRunnable runnable) {
         setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
-        new Thread(() -> {
+        Thread thread = new Thread(() -> {
             try {
                 Log.info(title + "...");
                 runnable.run();
@@ -843,7 +1039,14 @@ public class WorkbenchWindow extends JFrame {
             } finally {
                 SwingUtilities.invokeLater(() -> setCursor(Cursor.getDefaultCursor()));
             }
-        }, "packworkbench-task").start();
+        }, "packworkbench-task");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void shutdown() {
+        dispose();
+        System.exit(0);
     }
 
     private String defaultOutputName(PackFile pack) {
@@ -873,7 +1076,7 @@ public class WorkbenchWindow extends JFrame {
     }
 
     private static class AssetTableModel extends AbstractTableModel {
-        private final String[] columns = {"名称", "路径", "Side", "锁定", "来源"};
+        private final String[] columns = {"名称", "路径", "Side", "大小", "状态", "锁定"};
         private List<AssetRow> rows = List.of();
 
         void setRows(List<AssetRow> rows) {
@@ -888,10 +1091,11 @@ public class WorkbenchWindow extends JFrame {
             AssetRow row = rows.get(rowIndex);
             return switch (columnIndex) {
                 case 0 -> row.name();
-                case 1 -> row.path();
+                case 1 -> row.actualPath() == null || row.actualPath().isBlank() ? row.path() : row.actualPath();
                 case 2 -> row.side();
-                case 3 -> row.curseForge() ? (row.locked() ? "锁定" : "未锁") : "-";
-                case 4 -> row.source();
+                case 3 -> row.size();
+                case 4 -> row.status();
+                case 5 -> row.curseForge() ? (row.locked() ? "锁定" : "未锁") : "-";
                 default -> "";
             };
         }
@@ -902,7 +1106,7 @@ public class WorkbenchWindow extends JFrame {
     }
 
     private static class LocalJarTableModel extends AbstractTableModel {
-        private final String[] columns = {"名称", "路径", "大小"};
+        private final String[] columns = {"名称", "状态", "路径", "大小"};
         private List<LocalJarRow> rows = List.of();
 
         void setRows(List<LocalJarRow> rows) {
@@ -917,8 +1121,9 @@ public class WorkbenchWindow extends JFrame {
             LocalJarRow row = rows.get(rowIndex);
             return switch (columnIndex) {
                 case 0 -> row.name();
-                case 1 -> row.path();
-                case 2 -> row.size();
+                case 1 -> row.disabled() ? "禁用" : "启用";
+                case 2 -> row.path();
+                case 3 -> row.size();
                 default -> "";
             };
         }
@@ -928,22 +1133,28 @@ public class WorkbenchWindow extends JFrame {
         }
     }
 
-    private record LocalJarRow(String name, String path, String size, Path file) {
+    private record LocalJarRow(String name, String path, String size, Path file, boolean disabled, Path toggleTarget) {
         static LocalJarRow from(Path projectRoot, Path file) {
             Path absolute = file.toAbsolutePath().normalize();
             String displayPath = absolute.startsWith(projectRoot)
                 ? projectRoot.relativize(absolute).toString().replace(File.separatorChar, '/')
                 : absolute.toString();
+            String fileName = file.getFileName().toString();
+            boolean disabled = fileName.toLowerCase(Locale.ROOT).endsWith(".disabled");
+            String targetName = disabled
+                ? fileName.substring(0, fileName.length() - ".disabled".length())
+                : fileName + ".disabled";
+            Path toggleTarget = absolute.resolveSibling(targetName).toAbsolutePath().normalize();
             String size;
             try {
                 size = humanSize(Files.size(absolute));
             } catch (Exception e) {
                 size = "?";
             }
-            return new LocalJarRow(file.getFileName().toString(), displayPath, size, absolute);
+            return new LocalJarRow(fileName, displayPath, size, absolute, disabled, toggleTarget);
         }
 
-        private static String humanSize(long bytes) {
+        static String humanSize(long bytes) {
             if (bytes < 1024) return bytes + " B";
             double kib = bytes / 1024.0;
             if (kib < 1024) return String.format(Locale.ROOT, "%.1f KB", kib);
@@ -954,22 +1165,20 @@ public class WorkbenchWindow extends JFrame {
     }
 
     private record AssetRow(String type, String name, String path, String side, boolean locked,
-                            String source, String metaPath, IndexFile.FileEntry entry, boolean curseForge) {
-        static AssetRow from(IndexFile.FileEntry entry, link.infra.packwiz.installer.target.path.PackwizFilePath root) {
+                            String metaPath, IndexFile.FileEntry entry, boolean curseForge,
+                            String status, String size, String actualPath, Path actualFile,
+                            boolean disabled, Path toggleTarget) {
+        static AssetRow from(IndexFile.FileEntry entry, link.infra.packwiz.installer.target.path.PackwizFilePath root,
+                             Path projectRoot) {
             String path = entry.getDestURI().rebase(root).path();
             String metaPath = entry.metafile ? entry.file.rebase(root).path() : "";
             ModFile mod = entry.linkedFile;
-            String source = entry.metafile ? "metadata" : "file";
-            if (mod != null && mod.download != null) {
-                source = mod.download.mode() == DownloadMode.CURSEFORGE ? "CurseForge" : "URL";
-                if (mod.update.get("curseforge") instanceof CurseForgeUpdateData cf) {
-                    source += " " + cf.projectId() + "/" + cf.fileId();
-                }
-            }
             boolean locked = mod != null && mod.pin;
             boolean curseForge = mod != null && mod.update.get("curseforge") instanceof CurseForgeUpdateData;
             String side = mod != null && mod.side != null ? mod.side.name().toLowerCase(Locale.ROOT) : "both";
-            return new AssetRow(typeFor(path), entry.getName(), path, side, locked, source, metaPath, entry, curseForge);
+            LocalState local = LocalState.from(projectRoot, path);
+            return new AssetRow(typeFor(path), entry.getName(), path, side, locked, metaPath, entry, curseForge,
+                local.status(), local.size(), local.actualPath(), local.actualFile(), local.disabled(), local.toggleTarget());
         }
 
         private static String typeFor(String path) {
@@ -977,6 +1186,52 @@ public class WorkbenchWindow extends JFrame {
             if (lower.startsWith("resourcepacks/")) return "resourcepack";
             if (lower.startsWith("shaderpacks/")) return "shaderpack";
             return "mod";
+        }
+    }
+
+    private record LocalState(String status, String size, String actualPath, Path actualFile,
+                              boolean disabled, Path toggleTarget) {
+        static LocalState from(Path projectRoot, String relPath) {
+            String normalized = normalizeRelativePath(relPath);
+            if (normalized == null || normalized.isBlank()) {
+                return new LocalState("缺失", "", "", null, false, null);
+            }
+            Path enabled = projectRoot.resolve(normalized.replace('/', File.separatorChar)).toAbsolutePath().normalize();
+            Path disabledPath = projectRoot.resolve(appendDisabledSuffix(normalized).replace('/', File.separatorChar)).toAbsolutePath().normalize();
+            Path actual = null;
+            boolean disabled = false;
+            if (Files.isRegularFile(enabled)) {
+                actual = enabled;
+            } else if (Files.isRegularFile(disabledPath)) {
+                actual = disabledPath;
+                disabled = true;
+            }
+            if (actual == null) {
+                return new LocalState("缺失", "", "", null, false, null);
+            }
+            Path toggleTarget = null;
+            if (isDirectModsJarPath(normalized)) {
+                toggleTarget = disabled ? enabled : disabledPath;
+            }
+            String actualPath = actual.startsWith(projectRoot)
+                ? projectRoot.relativize(actual).toString().replace(File.separatorChar, '/')
+                : actual.toString();
+            return new LocalState(disabled ? "禁用" : "启用", humanSize(actual), actualPath, actual, disabled, toggleTarget);
+        }
+
+        private static String humanSize(Path path) {
+            try {
+                return LocalJarRow.humanSize(Files.size(path));
+            } catch (Exception e) {
+                return "?";
+            }
+        }
+
+        private static boolean isDirectModsJarPath(String path) {
+            String normalized = normalizeRelativePath(path);
+            if (normalized == null || !normalized.startsWith("mods/")) return false;
+            String rest = normalized.substring("mods/".length());
+            return !rest.isEmpty() && !rest.contains("/") && rest.toLowerCase(Locale.ROOT).endsWith(".jar");
         }
     }
 }

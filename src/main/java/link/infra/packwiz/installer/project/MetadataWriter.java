@@ -42,6 +42,31 @@ public class MetadataWriter {
         String folder = normalizeCategory(category);
         String slug = slugify(name.isBlank() ? filename : name);
         Path meta = repository.root().resolve(folder).resolve(".index").resolve(slug + ".pw.toml");
+        return writeCurseForgeMetadataTo(meta, name, filename, projectId, fileId, hash, side, optional, defaultEnabled);
+    }
+
+    public Path writeCurseForgeMetadataAt(String metaPath, String name, String filename, int projectId, int fileId,
+                                          String hash, String side, boolean optional, boolean defaultEnabled,
+                                          boolean pinned) throws IOException {
+        Path meta = repository.root().resolve(metaPath.replace('/', java.io.File.separatorChar)).normalize();
+        if (!meta.startsWith(repository.root())) {
+            throw new IOException("元数据路径位于项目目录外: " + metaPath);
+        }
+        writeCurseForgeMetadataTo(meta, name, filename, projectId, fileId, hash, side, optional, defaultEnabled);
+        if (pinned) writePinned(meta);
+        return meta;
+    }
+
+    public Path writeCurseForgeMetadata(String category, String name, String filename, int projectId, int fileId,
+                                        String hash, String side, boolean optional, boolean defaultEnabled,
+                                        boolean pinned) throws IOException {
+        Path meta = writeCurseForgeMetadata(category, name, filename, projectId, fileId, hash, side, optional, defaultEnabled);
+        if (pinned) writePinned(meta);
+        return meta;
+    }
+
+    private Path writeCurseForgeMetadataTo(Path meta, String name, String filename, int projectId, int fileId,
+                                           String hash, String side, boolean optional, boolean defaultEnabled) throws IOException {
         Files.createDirectories(meta.getParent());
         StringBuilder sb = new StringBuilder();
         sb.append("name = ").append(TomlUtil.quote(name)).append('\n');
@@ -59,25 +84,19 @@ public class MetadataWriter {
         return meta;
     }
 
-    public Path writeCurseForgeMetadata(String category, String name, String filename, int projectId, int fileId,
-                                        String hash, String side, boolean optional, boolean defaultEnabled,
-                                        boolean pinned) throws IOException {
-        Path meta = writeCurseForgeMetadata(category, name, filename, projectId, fileId, hash, side, optional, defaultEnabled);
-        if (pinned) {
-            List<String> lines = Files.readAllLines(meta, StandardCharsets.UTF_8);
-            StringBuilder out = new StringBuilder();
-            boolean wrote = false;
-            for (String line : lines) {
-                out.append(line).append('\n');
-                if (!wrote && line.startsWith("side")) {
-                    out.append("pin = true\n");
-                    wrote = true;
-                }
+    private void writePinned(Path meta) throws IOException {
+        List<String> lines = Files.readAllLines(meta, StandardCharsets.UTF_8);
+        StringBuilder out = new StringBuilder();
+        boolean wrote = false;
+        for (String line : lines) {
+            out.append(line).append('\n');
+            if (!wrote && line.startsWith("side")) {
+                out.append("pin = true\n");
+                wrote = true;
             }
-            if (!wrote) out.append("pin = true\n");
-            Files.writeString(meta, out.toString(), StandardCharsets.UTF_8);
         }
-        return meta;
+        if (!wrote) out.append("pin = true\n");
+        Files.writeString(meta, out.toString(), StandardCharsets.UTF_8);
     }
 
     public static String filenameFromUrl(String url) {

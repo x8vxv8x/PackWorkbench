@@ -33,6 +33,9 @@ public class CurseForgeSourcer {
     );
     private static final int DEPENDENCY_REQUIRED = 3;
     private static final int RELEASE = 1;
+    private static final int BATCH_SIZE = 50;
+    private static final int MURMUR2_M = 0x5bd1e995;
+    private static final int MURMUR2_R = 24;
     private static final List<String> LOADER_IDS = List.of("", "forge", "cauldron", "liteloader", "fabric", "quilt", "neoforge");
     private static final List<String> LOADER_NAMES = List.of("", "Forge", "Cauldron", "Liteloader", "Fabric", "Quilt", "NeoForge");
 
@@ -43,30 +46,10 @@ public class CurseForgeSourcer {
 
     private static class GetFilesResponse {
         List<CfFile> data = new ArrayList<>();
-        static class CfFile {
-            int id;
-            int modId;
-            String downloadUrl;
-            String fileName;
-            String displayName;
-            List<CfHash> hashes = new ArrayList<>();
-        }
-        static class CfHash {
-            int algo;
-            String value;
-        }
     }
 
     private static class GetModsResponse {
         List<CfMod> data = new ArrayList<>();
-        static class CfMod {
-            int id;
-            String name;
-            CfLinks links;
-        }
-        static class CfLinks {
-            String websiteUrl;
-        }
     }
 
     public record CurseForgeFileMetadata(
@@ -107,22 +90,55 @@ public class CurseForgeSourcer {
         List<Integer> requiredDependencies
     ) {}
 
+    public record LatestProjectFileResult(
+        int projectId,
+        CurseForgeProjectFile file,
+        Exception error
+    ) {
+        public boolean success() {
+            return file != null && error == null;
+        }
+    }
+
     public static CurseForgeFileMetadata getFileMetadata(int fileId, ClientHolder clientHolder) throws Exception {
-        var reqBody = GSON.toJson(new GetFilesRequest(List.of(fileId)));
-        var req = buildCfApiRequest("/v1/mods/files", reqBody);
-        HttpResponse<InputStream> res = clientHolder.httpRequest(req);
-        if (res.statusCode() < 200 || res.statusCode() >= 300 || res.body() == null) {
-            try { if (res.body() != null) res.body().close(); } catch (IOException ignored) {}
-            throw new IOException("CurseForge 文件查询失败: HTTP " + res.statusCode());
-        }
-        SearchFilesResponse resData;
-        try (var body = res.body()) {
-            resData = GSON.fromJson(new InputStreamReader(body, StandardCharsets.UTF_8), SearchFilesResponse.class);
-        }
-        if (resData == null || resData.data == null || resData.data.isEmpty()) {
+        var metadata = getFilesMetadata(List.of(fileId), clientHolder);
+        var file = metadata.get(fileId);
+        if (file == null) {
             throw new IOException("CurseForge 未返回文件数据: " + fileId);
         }
-        var file = resData.data.getFirst();
+        return toFileMetadata(file);
+    }
+
+    public static Map<Integer, CurseForgeFileMetadata> resolveCurseForgeFiles(Collection<Integer> fileIds,
+                                                                              ClientHolder clientHolder) throws Exception {
+        var files = getFilesMetadata(fileIds, clientHolder);
+        var out = new LinkedHashMap<Integer, CurseForgeFileMetadata>();
+        for (var entry : files.entrySet()) {
+            out.put(entry.getKey(), toFileMetadata(entry.getValue()));
+        }
+        return out;
+    }
+
+    public static Map<Integer, CurseForgeProjectFile> resolveProjectFiles(Collection<Integer> fileIds,
+                                                                          ClientHolder clientHolder) throws Exception {
+        var files = getFilesMetadata(fileIds, clientHolder);
+        var out = new LinkedHashMap<Integer, CurseForgeProjectFile>();
+        for (var file : files.values()) {
+            out.put(file.id, new CurseForgeProjectFile(
+                file.modId,
+                file.id,
+                file.displayName != null && !file.displayName.isBlank() ? file.displayName : file.fileName,
+                "",
+                file.fileName != null ? file.fileName : "curseforge-" + file.id + ".jar",
+                sha1(file),
+                "mc-mods",
+                requiredDependencies(file)
+            ));
+        }
+        return out;
+    }
+
+    private static CurseForgeFileMetadata toFileMetadata(CfFile file) {
         String sha1 = sha1(file);
         String filename = file.fileName != null && !file.fileName.isBlank()
             ? file.fileName : "curseforge-" + file.id + ".jar";
@@ -145,17 +161,7 @@ public class CurseForgeSourcer {
         CfFile file = parsed.fileId() > 0
             ? getFile(mod.id, parsed.fileId(), clientHolder)
             : latestCompatibleFile(mod, minecraftVersions, loaders, clientHolder);
-        String sha1 = sha1(file);
-        return new CurseForgeProjectFile(
-            mod.id,
-            file.id,
-            mod.name != null ? mod.name : file.displayName,
-            mod.slug,
-            file.fileName != null ? file.fileName : "curseforge-" + file.id + ".jar",
-            sha1,
-            parsed.category() != null && !parsed.category().isBlank() ? parsed.category() : "mc-mods",
-            requiredDependencies(file)
-        );
+        return toProjectFile(mod, file, parsed.category() != null && !parsed.category().isBlank() ? parsed.category() : "mc-mods");
     }
 
     public static CurseForgeProjectFile checkLatest(int projectId, int currentFileId, String minecraftVersion,
@@ -166,18 +172,46 @@ public class CurseForgeSourcer {
     public static CurseForgeProjectFile checkLatest(int projectId, int currentFileId, List<String> minecraftVersions,
                                                     List<String> loaders, ClientHolder clientHolder) throws Exception {
         CfMod mod = getMod(projectId, clientHolder);
-        CfFile latest = latestCompatibleFile(mod, minecraftVersions, loaders, clientHolder);
-        if (latest.id == currentFileId) return null;
-        return new CurseForgeProjectFile(
-            mod.id,
-            latest.id,
-            mod.name,
-            mod.slug,
-            latest.fileName,
-            sha1(latest),
-            "mc-mods",
-            requiredDependencies(latest)
-        );
+        return checkLatest(mod, currentFileId, minecraftVersions, loaders, clientHolder);
+    }
+
+    public static Map<Integer, LatestProjectFileResult> checkLatestMultipleByProject(Collection<Integer> projectIds,
+                                                                                     List<String> minecraftVersions,
+                                                                                     List<String> loaders,
+                                                                                     ClientHolder clientHolder) throws Exception {
+        var results = new LinkedHashMap<Integer, LatestProjectFileResult>();
+        if (projectIds.isEmpty()) return results;
+        var mods = getModsMetadata(projectIds, clientHolder);
+        for (int projectId : new LinkedHashSet<>(projectIds)) {
+            CfMod mod = mods.get(projectId);
+            if (mod == null) {
+                results.put(projectId, new LatestProjectFileResult(projectId, null,
+                    new IOException("CurseForge 未返回项目数据: " + projectId)));
+                continue;
+            }
+            try {
+                CfFile latest = latestCompatibleFile(mod, minecraftVersions, loaders, clientHolder, false);
+                results.put(projectId, new LatestProjectFileResult(projectId, toProjectFile(mod, latest, "mc-mods"), null));
+            } catch (Exception e) {
+                results.put(projectId, new LatestProjectFileResult(projectId, null, e));
+            }
+        }
+        return results;
+    }
+
+    public static List<CurseForgeProjectFile> resolveProjects(Collection<Integer> projectIds,
+                                                              List<String> minecraftVersions,
+                                                              List<String> loaders,
+                                                              ClientHolder clientHolder) throws Exception {
+        var mods = getModsMetadata(projectIds, clientHolder);
+        var out = new ArrayList<CurseForgeProjectFile>();
+        for (int projectId : projectIds) {
+            CfMod mod = mods.get(projectId);
+            if (mod == null) throw new IOException("CurseForge 未返回项目数据: " + projectId);
+            CfFile latest = latestCompatibleFile(mod, minecraftVersions, loaders, clientHolder);
+            out.add(toProjectFile(mod, latest, "mc-mods"));
+        }
+        return out;
     }
 
     public static FingerprintReport matchFingerprints(Map<Long, Path> fingerprints, ClientHolder clientHolder) throws Exception {
@@ -194,8 +228,16 @@ public class CurseForgeSourcer {
         }
         var matches = new ArrayList<FingerprintMatch>();
         if (response != null && response.data != null && response.data.exactMatches != null) {
+            var missingModIds = new LinkedHashSet<Integer>();
             for (CfFingerprintMatch match : response.data.exactMatches) {
-                CfMod mod = match.mod != null ? match.mod : getMod(match.id, clientHolder);
+                if (match.mod == null) missingModIds.add(match.id);
+            }
+            Map<Integer, CfMod> missingMods = missingModIds.isEmpty()
+                ? Map.of()
+                : getModsMetadata(missingModIds, clientHolder);
+            for (CfFingerprintMatch match : response.data.exactMatches) {
+                CfMod mod = match.mod != null ? match.mod : missingMods.get(match.id);
+                if (mod == null) continue;
                 CfFile file = match.file;
                 matches.add(new FingerprintMatch(
                     file.fingerprint,
@@ -217,70 +259,152 @@ public class CurseForgeSourcer {
         return new FingerprintReport(matches, unmatched, partial);
     }
 
+    private static CurseForgeProjectFile checkLatest(CfMod mod, int currentFileId, List<String> minecraftVersions,
+                                                     List<String> loaders, ClientHolder clientHolder) throws Exception {
+        CfFile latest = latestCompatibleFile(mod, minecraftVersions, loaders, clientHolder, true);
+        if (latest.id == currentFileId) return null;
+        return toProjectFile(mod, latest, "mc-mods");
+    }
+
+    private static CurseForgeProjectFile toProjectFile(CfMod mod, CfFile file, String category) {
+        return new CurseForgeProjectFile(
+            mod.id,
+            file.id,
+            mod.name != null ? mod.name : file.displayName,
+            mod.slug,
+            file.fileName != null ? file.fileName : "curseforge-" + file.id + ".jar",
+            sha1(file),
+            category,
+            requiredDependencies(file)
+        );
+    }
+
     public static long fingerprint(Path file) throws IOException {
-        byte[] input = Files.readAllBytes(file);
-        var normalized = new ByteArrayOutputStream(input.length);
-        for (byte b : input) {
-            if (b != 9 && b != 10 && b != 13 && b != 32) normalized.write(b);
+        int h = 1 ^ normalizedLength(file);
+        int bufferPos = 0;
+        byte[] tail = new byte[4];
+        byte[] input = new byte[8192];
+        try (InputStream in = Files.newInputStream(file)) {
+            int read;
+            while ((read = in.read(input)) != -1) {
+                for (int i = 0; i < read; i++) {
+                    byte b = input[i];
+                    if (b == 9 || b == 10 || b == 13 || b == 32) continue;
+                    tail[bufferPos++] = b;
+                    if (bufferPos == 4) {
+                        int k = (tail[0] & 0xff)
+                            | ((tail[1] & 0xff) << 8)
+                            | ((tail[2] & 0xff) << 16)
+                            | ((tail[3] & 0xff) << 24);
+                        k *= MURMUR2_M;
+                        k ^= k >>> MURMUR2_R;
+                        k *= MURMUR2_M;
+                        h *= MURMUR2_M;
+                        h ^= k;
+                        bufferPos = 0;
+                    }
+                }
+            }
         }
-        byte[] bytes = normalized.toByteArray();
-        final int m = 0x5bd1e995;
-        final int r = 24;
-        int h = 1 ^ bytes.length;
-        int len = bytes.length;
-        int i = 0;
-        while (len >= 4) {
-            int k = (bytes[i] & 0xff)
-                | ((bytes[i + 1] & 0xff) << 8)
-                | ((bytes[i + 2] & 0xff) << 16)
-                | ((bytes[i + 3] & 0xff) << 24);
-            k *= m;
-            k ^= k >>> r;
-            k *= m;
-            h *= m;
-            h ^= k;
-            i += 4;
-            len -= 4;
-        }
-        switch (len) {
-            case 3 -> h ^= (bytes[i + 2] & 0xff) << 16;
-            case 2 -> h ^= (bytes[i + 1] & 0xff) << 8;
+        switch (bufferPos) {
+            case 3 -> h ^= (tail[2] & 0xff) << 16;
+            case 2 -> h ^= (tail[1] & 0xff) << 8;
             case 1 -> {
-                h ^= bytes[i] & 0xff;
-                h *= m;
+                h ^= tail[0] & 0xff;
+                h *= MURMUR2_M;
             }
             default -> {}
         }
         h ^= h >>> 13;
-        h *= m;
+        h *= MURMUR2_M;
         h ^= h >>> 15;
         return Integer.toUnsignedLong(h);
     }
 
+    private static int normalizedLength(Path file) throws IOException {
+        int length = 0;
+        byte[] input = new byte[8192];
+        try (InputStream in = Files.newInputStream(file)) {
+            int read;
+            while ((read = in.read(input)) != -1) {
+                for (int i = 0; i < read; i++) {
+                    byte b = input[i];
+                    if (b != 9 && b != 10 && b != 13 && b != 32) length++;
+                }
+            }
+        }
+        return length;
+    }
+
     private static CfMod getMod(int projectId, ClientHolder clientHolder) throws Exception {
-        HttpRequest req = buildCfApiGetRequest("/v1/mods/" + projectId);
-        HttpResponse<InputStream> res = clientHolder.httpRequest(req);
-        if (res.statusCode() < 200 || res.statusCode() >= 300 || res.body() == null) {
-            try { if (res.body() != null) res.body().close(); } catch (IOException ignored) {}
-            throw new IOException("CurseForge 项目查询失败: HTTP " + res.statusCode());
-        }
-        try (var body = res.body()) {
-            var data = GSON.fromJson(new InputStreamReader(body, StandardCharsets.UTF_8), GetModResponse.class);
-            return data.data;
-        }
+        var mods = getModsMetadata(List.of(projectId), clientHolder);
+        CfMod mod = mods.get(projectId);
+        if (mod == null) throw new IOException("CurseForge 未返回项目数据: " + projectId);
+        return mod;
     }
 
     private static CfFile getFile(int projectId, int fileId, ClientHolder clientHolder) throws Exception {
-        HttpRequest req = buildCfApiGetRequest("/v1/mods/" + projectId + "/files/" + fileId);
-        HttpResponse<InputStream> res = clientHolder.httpRequest(req);
-        if (res.statusCode() < 200 || res.statusCode() >= 300 || res.body() == null) {
-            try { if (res.body() != null) res.body().close(); } catch (IOException ignored) {}
-            throw new IOException("CurseForge 文件查询失败: HTTP " + res.statusCode());
+        var files = getFilesMetadata(List.of(fileId), clientHolder);
+        CfFile file = files.get(fileId);
+        if (file == null) throw new IOException("CurseForge 未返回文件数据: " + fileId);
+        if (projectId > 0 && file.modId != projectId) {
+            throw new IOException("CurseForge 文件所属项目不匹配: " + fileId);
         }
-        try (var body = res.body()) {
-            var data = GSON.fromJson(new InputStreamReader(body, StandardCharsets.UTF_8), GetFileResponse.class);
-            return data.data;
+        return file;
+    }
+
+    private static Map<Integer, CfMod> getModsMetadata(Collection<Integer> modIds, ClientHolder clientHolder) throws Exception {
+        var out = new LinkedHashMap<Integer, CfMod>();
+        for (var batch : batches(modIds)) {
+            var req = buildCfApiRequest("/v1/mods", GSON.toJson(new GetModsRequest(batch)));
+            HttpResponse<InputStream> res = clientHolder.httpRequest(req);
+            if (res.statusCode() < 200 || res.statusCode() >= 300 || res.body() == null) {
+                try { if (res.body() != null) res.body().close(); } catch (IOException ignored) {}
+                throw new IOException("CurseForge 项目批量查询失败: HTTP " + res.statusCode());
+            }
+            GetModsResponse data;
+            try (var body = res.body()) {
+                data = GSON.fromJson(new InputStreamReader(body, StandardCharsets.UTF_8), GetModsResponse.class);
+            }
+            if (data == null || data.data == null) continue;
+            for (CfMod mod : data.data) {
+                out.put(mod.id, mod);
+            }
         }
+        return out;
+    }
+
+    private static Map<Integer, CfFile> getFilesMetadata(Collection<Integer> fileIds, ClientHolder clientHolder) throws Exception {
+        var out = new LinkedHashMap<Integer, CfFile>();
+        for (var batch : batches(fileIds)) {
+            var req = buildCfApiRequest("/v1/mods/files", GSON.toJson(new GetFilesRequest(batch)));
+            HttpResponse<InputStream> res = clientHolder.httpRequest(req);
+            if (res.statusCode() < 200 || res.statusCode() >= 300 || res.body() == null) {
+                try { if (res.body() != null) res.body().close(); } catch (IOException ignored) {}
+                throw new IOException("CurseForge 文件批量查询失败: HTTP " + res.statusCode());
+            }
+            GetFilesResponse data;
+            try (var body = res.body()) {
+                data = GSON.fromJson(new InputStreamReader(body, StandardCharsets.UTF_8), GetFilesResponse.class);
+            }
+            if (data == null || data.data == null) continue;
+            for (CfFile file : data.data) {
+                out.put(file.id, file);
+            }
+        }
+        return out;
+    }
+
+    private static List<List<Integer>> batches(Collection<Integer> ids) {
+        var unique = new ArrayList<Integer>();
+        for (Integer id : new LinkedHashSet<>(ids)) {
+            if (id != null && id > 0) unique.add(id);
+        }
+        var batches = new ArrayList<List<Integer>>();
+        for (int i = 0; i < unique.size(); i += BATCH_SIZE) {
+            batches.add(new ArrayList<>(unique.subList(i, Math.min(i + BATCH_SIZE, unique.size()))));
+        }
+        return batches;
     }
 
     private static CfMod searchOne(String slugOrSearch, String category, String minecraftVersion, int loader,
@@ -319,6 +443,11 @@ public class CurseForgeSourcer {
 
     private static CfFile latestCompatibleFile(CfMod mod, List<String> minecraftVersions, List<String> loaders,
                                                ClientHolder clientHolder) throws Exception {
+        return latestCompatibleFile(mod, minecraftVersions, loaders, clientHolder, true);
+    }
+
+    private static CfFile latestCompatibleFile(CfMod mod, List<String> minecraftVersions, List<String> loaders,
+                                               ClientHolder clientHolder, boolean fetchIndexedFile) throws Exception {
         CfFile best = null;
         int bestMc = -1;
         int bestLoader = 0;
@@ -341,7 +470,7 @@ public class CurseForgeSourcer {
                 if (mc < 0 || loader < 0) continue;
                 int compare = compareCandidate(mc, loader, index.fileId, bestMc, bestLoader, best != null ? best.id : 0);
                 if (compare <= 0) continue;
-                best = getFile(mod.id, index.fileId, clientHolder);
+                best = fetchIndexedFile ? getFile(mod.id, index.fileId, clientHolder) : fileFromIndex(mod.id, index);
                 bestMc = mc;
                 bestLoader = loader;
             }
@@ -350,6 +479,17 @@ public class CurseForgeSourcer {
             throw new IOException("未找到兼容当前 Minecraft/Loader 的 CurseForge 文件: " + mod.name);
         }
         return best;
+    }
+
+    private static CfFile fileFromIndex(int projectId, CfLatestFileIndex index) {
+        var file = new CfFile();
+        file.id = index.fileId;
+        file.modId = projectId;
+        file.fileName = index.filename != null && !index.filename.isBlank()
+            ? index.filename
+            : "curseforge-" + index.fileId + ".jar";
+        file.displayName = file.fileName;
+        return file;
     }
 
     private static int compareCandidate(int mc, int loader, int fileId, int bestMc, int bestLoader, int bestFileId) {
@@ -419,18 +559,6 @@ public class CurseForgeSourcer {
             return 720410;
         }
         return depId;
-    }
-
-    private static int bestLoader(List<String> loaders) {
-        if (loaders == null) return 0;
-        for (String loader : loaders) {
-            String lower = loader.toLowerCase(Locale.ROOT);
-            if ("neoforge".equals(lower)) return 6;
-            if ("quilt".equals(lower)) return 5;
-            if ("fabric".equals(lower)) return 4;
-            if ("forge".equals(lower)) return 1;
-        }
-        return 0;
     }
 
     private static String sha1(CfFile file) {
@@ -539,20 +667,8 @@ public class CurseForgeSourcer {
 
     private record ParsedProject(int projectId, int fileId, String slug, String category) {}
 
-    private static class GetModResponse {
-        CfMod data;
-    }
-
-    private static class GetFileResponse {
-        CfFile data;
-    }
-
     private static class SearchResponse {
         List<CfMod> data = new ArrayList<>();
-    }
-
-    private static class SearchFilesResponse {
-        List<CfFile> data = new ArrayList<>();
     }
 
     private static class CfMod {
@@ -563,6 +679,11 @@ public class CurseForgeSourcer {
         int primaryCategoryId;
         List<CfFile> latestFiles = new ArrayList<>();
         List<CfLatestFileIndex> latestFilesIndexes = new ArrayList<>();
+        CfLinks links;
+    }
+
+    private static class CfLinks {
+        String websiteUrl;
     }
 
     private static class CfLatestFileIndex {
@@ -575,6 +696,7 @@ public class CurseForgeSourcer {
     private static class CfFile {
         int id;
         int modId;
+        String downloadUrl;
         String fileName;
         String displayName;
         int releaseType = RELEASE;
@@ -635,32 +757,16 @@ public class CurseForgeSourcer {
             fileIdMap.computeIfAbsent(fileId, k -> new ArrayList<>()).add(mod);
         }
 
-        // Fetch file metadata
-        var reqBody = GSON.toJson(new GetFilesRequest(new ArrayList<>(fileIdMap.keySet())));
-        var req = buildCfApiRequest("/v1/mods/files", reqBody);
-        HttpResponse<InputStream> res;
+        Map<Integer, CfFile> resData;
         try {
-            res = clientHolder.httpRequest(req);
+            resData = getFilesMetadata(fileIdMap.keySet(), clientHolder);
         } catch (Exception e) {
             failures.add(new ResolveFailure(null, "其他", new Exception("解析 CurseForge 文件数据元数据失败：" + e.getMessage()), null, false));
             return failures;
         }
-        if (res.statusCode() < 200 || res.statusCode() >= 300 || res.body() == null) {
-            try { if (res.body() != null) res.body().close(); } catch (IOException ignored) {}
-            failures.add(new ResolveFailure(null, "其他", new Exception("解析 CurseForge 文件数据元数据失败：错误代码 " + res.statusCode()), null, false));
-            return failures;
-        }
-
-        GetFilesResponse resData;
-        try (var body = res.body()) {
-            resData = GSON.fromJson(new InputStreamReader(body, StandardCharsets.UTF_8), GetFilesResponse.class);
-        } catch (IOException e) {
-            failures.add(new ResolveFailure(null, "其他", new Exception("读取 CurseForge 响应失败：" + e.getMessage()), null, false));
-            return failures;
-        }
 
         var manualDownloadMods = new HashMap<Integer, List<Integer>>();
-        for (var file : resData.data) {
+        for (var file : resData.values()) {
             if (!fileIdMap.containsKey(file.id)) {
                 failures.add(new ResolveFailure(null, String.valueOf(file.id),
                     new Exception("从结果中找不到文件：ID " + file.id + "，项目 ID " + file.modId), null, false));
@@ -693,30 +799,15 @@ public class CurseForgeSourcer {
 
         // Fetch mod metadata for manual-download mods
         if (!manualDownloadMods.isEmpty()) {
-            var reqModsBody = GSON.toJson(new GetModsRequest(new ArrayList<>(manualDownloadMods.keySet())));
-            var reqMods = buildCfApiRequest("/v1/mods", reqModsBody);
-            HttpResponse<InputStream> resMods;
+            Map<Integer, CfMod> resModsData;
             try {
-                resMods = clientHolder.httpRequest(reqMods);
+                resModsData = getModsMetadata(manualDownloadMods.keySet(), clientHolder);
             } catch (Exception e) {
                 failures.add(new ResolveFailure(null, "其他", new Exception("解析 CurseForge 模组数据元数据失败：" + e.getMessage()), null, false));
                 return failures;
             }
-            if (resMods.statusCode() < 200 || resMods.statusCode() >= 300 || resMods.body() == null) {
-                try { if (resMods.body() != null) resMods.body().close(); } catch (IOException ignored) {}
-                failures.add(new ResolveFailure(null, "其他", new Exception("解析 CurseForge 模组数据元数据失败：错误代码 " + resMods.statusCode()), null, false));
-                return failures;
-            }
 
-            GetModsResponse resModsData;
-            try (var body = resMods.body()) {
-                resModsData = GSON.fromJson(new InputStreamReader(body, StandardCharsets.UTF_8), GetModsResponse.class);
-            } catch (IOException e) {
-                failures.add(new ResolveFailure(null, "其他", new Exception("读取 CurseForge 模组响应失败：" + e.getMessage()), null, false));
-                return failures;
-            }
-
-            for (var mod : resModsData.data) {
+            for (var mod : resModsData.values()) {
                 if (!manualDownloadMods.containsKey(mod.id)) {
                     failures.add(new ResolveFailure(null, mod.name, new Exception("从结果中找不到项目：ID " + mod.id), null, false));
                     continue;
@@ -739,7 +830,7 @@ public class CurseForgeSourcer {
         return failures;
     }
 
-    private static void applyCurseForgeSha1(GetFilesResponse.CfFile file, List<IndexFile.FileEntry> entries) {
+    private static void applyCurseForgeSha1(CfFile file, List<IndexFile.FileEntry> entries) {
         String sha1 = file.hashes == null ? null : file.hashes.stream()
             .filter(hash -> hash.algo == 1)
             .map(hash -> hash.value)

@@ -2,8 +2,10 @@ plugins {
 	id 'java'
 	id 'application'
 	id 'com.gradleup.shadow' version '9.4.1'
-	id 'com.palantir.git-version' version '3.1.0'
 }
+
+def appName = 'PackWorkbench'
+def appVersion = '1.0.0'
 
 java {
 	toolchain {
@@ -27,20 +29,17 @@ application {
 	mainClass = 'link.infra.packwiz.installer.Main'
 }
 
-version = gitVersion()
+version = appVersion
+
+base {
+	archivesName = appName
+}
 
 jar {
 	manifest {
 		attributes 'Main-Class': 'link.infra.packwiz.installer.Main'
 		attributes 'Implementation-Version': project.version
 	}
-}
-
-shadowJar {
-	exclude 'META-INF/maven/**/*'
-	exclude 'META-INF/proguard/**/*'
-	exclude 'META-INF/LICENSE.txt'
-	exclude 'META-INF/NOTICE.txt'
 }
 
 tasks.withType(JavaCompile).configureEach {

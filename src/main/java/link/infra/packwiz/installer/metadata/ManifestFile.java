@@ -40,6 +40,7 @@ public class ManifestFile {
         public boolean isOptional = false;
         public boolean optionValue = true;
         public boolean onlyOtherSide = false;
+        public boolean disabled = false;
 
         public void backup() {
             revert = new File();
@@ -50,6 +51,7 @@ public class ManifestFile {
             revert.isOptional = isOptional;
             revert.optionValue = optionValue;
             revert.onlyOtherSide = onlyOtherSide;
+            revert.disabled = disabled;
         }
 
         public void restoreFromBackup() {
@@ -61,6 +63,7 @@ public class ManifestFile {
                 isOptional = revert.isOptional;
                 optionValue = revert.optionValue;
                 onlyOtherSide = revert.onlyOtherSide;
+                disabled = revert.disabled;
                 revert = null;
             }
         }

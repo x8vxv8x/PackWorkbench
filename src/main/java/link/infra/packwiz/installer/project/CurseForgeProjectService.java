@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 public class CurseForgeProjectService {
     private static final int MAX_DEPENDENCY_CYCLES = 20;
@@ -21,6 +22,13 @@ public class CurseForgeProjectService {
 
     public CurseForgeProjectService(PackRepository repository) {
         this.repository = repository;
+    }
+
+    public CurseForgeSourcer.CurseForgeProjectFile resolveProjectPreview(String input) throws Exception {
+        PackFile pack = repository.loadPack();
+        try (var holder = new CloseableClientHolder()) {
+            return CurseForgeSourcer.resolveProject(input, pack.supportedMinecraftVersions(), loaders(pack), holder.client());
+        }
     }
 
     public List<Path> addProjectWithDependencies(String input, String category, String side,
@@ -40,11 +48,12 @@ public class CurseForgeProjectService {
             while (!queue.isEmpty() && cycles < MAX_DEPENDENCY_CYCLES) {
                 queue.removeIf(installed::contains);
                 if (queue.isEmpty()) break;
-                var current = new ArrayList<>(queue);
+                var current = new LinkedHashSet<>(queue);
                 queue.clear();
-                for (int depId : current) {
+                var deps = CurseForgeSourcer.resolveProjects(current, pack.supportedMinecraftVersions(), loaders(pack), holder.client());
+                for (var dep : deps) {
+                    int depId = dep.projectId();
                     if (installed.contains(depId)) continue;
-                    var dep = CurseForgeSourcer.resolveProject(String.valueOf(depId), pack.supportedMinecraftVersions(), loaders(pack), holder.client());
                     written.add(write(dep, "mods", "both", false, true));
                     installed.add(dep.projectId());
                     for (int next : dep.requiredDependencies()) {
@@ -127,9 +136,28 @@ public class CurseForgeProjectService {
         IndexFile index = repository.loadIndexWithMetadata(pack);
         var results = new ArrayList<UpdateResult>();
         try (var holder = new CloseableClientHolder()) {
+            var candidates = new ArrayList<IndexFile.FileEntry>();
+            var projectIds = new LinkedHashSet<Integer>();
             for (var entry : index.files) {
                 if (!entry.metafile || entry.linkedFile == null) continue;
-                UpdateResult result = checkUpdate(entry, pack, holder.client());
+                ModFile mod = entry.linkedFile;
+                if (mod.update.get("curseforge") == null) continue;
+                if (mod.pin) {
+                    results.add(pinnedResult(entry, mod));
+                    continue;
+                }
+                CurseForgeUpdateData cf = (CurseForgeUpdateData) mod.update.get("curseforge");
+                candidates.add(entry);
+                projectIds.add(cf.projectId());
+            }
+            var latestByProject = CurseForgeSourcer.checkLatestMultipleByProject(
+                projectIds,
+                pack.supportedMinecraftVersions(),
+                loaders(pack),
+                holder.client()
+            );
+            for (var entry : candidates) {
+                UpdateResult result = checkUpdate(entry, latestByProject);
                 if (result != null) results.add(result);
             }
         }
@@ -145,8 +173,102 @@ public class CurseForgeProjectService {
 
     public void applyUpdate(UpdateResult update) throws Exception {
         MetadataWriter writer = new MetadataWriter(repository);
-        writer.writeCurseForgeMetadata(
-            categoryForPath(update.metaPath()),
+        try (var holder = new CloseableClientHolder()) {
+            writeUpdate(writer, hydrateUpdate(update, holder.client()));
+        }
+        new IndexRefresher(repository).refreshAndWrite();
+    }
+
+    public void applyUpdates(List<UpdateResult> updates) throws Exception {
+        var applicable = updates.stream()
+            .filter(UpdateResult::updateAvailable)
+            .toList();
+        if (applicable.isEmpty()) return;
+        MetadataWriter writer = new MetadataWriter(repository);
+        try (var holder = new CloseableClientHolder()) {
+            var fileIds = applicable.stream().map(UpdateResult::newFileId).toList();
+            var files = CurseForgeSourcer.resolveProjectFiles(fileIds, holder.client());
+            for (UpdateResult update : applicable) {
+                var file = files.get(update.newFileId());
+                writeUpdate(writer, file != null ? update.withFile(file) : update);
+            }
+        }
+        new IndexRefresher(repository).refreshAndWrite();
+    }
+
+    private UpdateResult checkUpdate(IndexFile.FileEntry entry, PackFile pack, ClientHolder holder) throws Exception {
+        ModFile mod = entry.linkedFile;
+        if (mod == null || mod.update.get("curseforge") == null) return null;
+        if (mod.pin) {
+            return pinnedResult(entry, mod);
+        }
+        CurseForgeUpdateData cf = (CurseForgeUpdateData) mod.update.get("curseforge");
+        var latest = CurseForgeSourcer.checkLatest(cf.projectId(), cf.fileId(),
+            pack.supportedMinecraftVersions(), loaders(pack), holder);
+        return updateResult(entry, mod, cf, latest, null);
+    }
+
+    private UpdateResult checkUpdate(IndexFile.FileEntry entry,
+                                     Map<Integer, CurseForgeSourcer.LatestProjectFileResult> latestByProject) {
+        ModFile mod = entry.linkedFile;
+        if (mod == null || mod.update.get("curseforge") == null) return null;
+        CurseForgeUpdateData cf = (CurseForgeUpdateData) mod.update.get("curseforge");
+        var latest = latestByProject.get(cf.projectId());
+        if (latest == null) {
+            return updateResult(entry, mod, cf, null, new IllegalStateException("CurseForge 未返回项目数据"));
+        }
+        return updateResult(entry, mod, cf, latest.file(), latest.error());
+    }
+
+    private UpdateResult pinnedResult(IndexFile.FileEntry entry, ModFile mod) {
+            return new UpdateResult(entry.file.rebase(repository.rootPath()).path(), mod.name,
+                0, 0, 0, mod.filename != null ? mod.filename.filename() : "", "",
+                mod.filename != null ? mod.filename.filename() : "",
+                "已锁定，跳过更新", true, PackRepository.sideName(mod),
+                mod.option != null && mod.option.optional(),
+                mod.option != null && mod.option.defaultValue());
+    }
+
+    private UpdateResult updateResult(IndexFile.FileEntry entry, ModFile mod, CurseForgeUpdateData cf,
+                                      CurseForgeSourcer.CurseForgeProjectFile latest, Exception error) {
+        if (error != null) {
+            return new UpdateResult(entry.file.rebase(repository.rootPath()).path(), mod.name,
+                cf.projectId(), cf.fileId(), cf.fileId(),
+                mod.filename != null ? mod.filename.filename() : "", mod.download != null ? mod.download.hash() : "",
+                mod.filename != null ? mod.filename.filename() : "",
+                "检查失败: " + Objects.toString(error.getMessage(), error.getClass().getSimpleName()),
+                false, PackRepository.sideName(mod),
+                mod.option != null && mod.option.optional(),
+                mod.option != null && mod.option.defaultValue());
+        }
+        if (latest == null) {
+            return new UpdateResult(entry.file.rebase(repository.rootPath()).path(), mod.name,
+                cf.projectId(), cf.fileId(), cf.fileId(),
+                mod.filename != null ? mod.filename.filename() : "", mod.download != null ? mod.download.hash() : "",
+                mod.filename != null ? mod.filename.filename() : "",
+                "已是最新", false, PackRepository.sideName(mod),
+                mod.option != null && mod.option.optional(),
+                mod.option != null && mod.option.defaultValue());
+        }
+        return new UpdateResult(entry.file.rebase(repository.rootPath()).path(), latest.name(),
+            latest.projectId(), cf.fileId(), latest.fileId(), latest.filename(), latest.sha1(),
+            mod.filename != null ? mod.filename.filename() : "",
+            "可更新: " + (mod.filename != null ? mod.filename.filename() : mod.name) + " -> " + latest.filename(),
+            false, PackRepository.sideName(mod),
+            mod.option != null && mod.option.optional(),
+            mod.option != null && mod.option.defaultValue());
+    }
+
+    private UpdateResult hydrateUpdate(UpdateResult update, ClientHolder holder) throws Exception {
+        if (!update.updateAvailable() || update.newSha1() != null && !update.newSha1().isBlank()) return update;
+        var files = CurseForgeSourcer.resolveProjectFiles(List.of(update.newFileId()), holder);
+        var file = files.get(update.newFileId());
+        return file != null ? update.withFile(file) : update;
+    }
+
+    private void writeUpdate(MetadataWriter writer, UpdateResult update) throws Exception {
+        writer.writeCurseForgeMetadataAt(
+            update.metaPath(),
             update.name(),
             update.newFilename(),
             update.projectId(),
@@ -157,36 +279,6 @@ public class CurseForgeProjectService {
             update.defaultEnabled(),
             update.pinned()
         );
-        new IndexRefresher(repository).refreshAndWrite();
-    }
-
-    private UpdateResult checkUpdate(IndexFile.FileEntry entry, PackFile pack, ClientHolder holder) throws Exception {
-        ModFile mod = entry.linkedFile;
-        if (mod == null || mod.update.get("curseforge") == null) return null;
-        if (mod.pin) {
-            return new UpdateResult(entry.file.rebase(repository.rootPath()).path(), mod.name,
-                0, 0, 0, mod.filename != null ? mod.filename.filename() : "", "",
-                "已锁定，跳过更新", true, PackRepository.sideName(mod),
-                mod.option != null && mod.option.optional(),
-                mod.option != null && mod.option.defaultValue());
-        }
-        CurseForgeUpdateData cf = (CurseForgeUpdateData) mod.update.get("curseforge");
-        var latest = CurseForgeSourcer.checkLatest(cf.projectId(), cf.fileId(),
-            pack.supportedMinecraftVersions(), loaders(pack), holder);
-        if (latest == null) {
-            return new UpdateResult(entry.file.rebase(repository.rootPath()).path(), mod.name,
-                cf.projectId(), cf.fileId(), cf.fileId(),
-                mod.filename != null ? mod.filename.filename() : "", mod.download != null ? mod.download.hash() : "",
-                "已是最新", false, PackRepository.sideName(mod),
-                mod.option != null && mod.option.optional(),
-                mod.option != null && mod.option.defaultValue());
-        }
-        return new UpdateResult(entry.file.rebase(repository.rootPath()).path(), latest.name(),
-            latest.projectId(), cf.fileId(), latest.fileId(), latest.filename(), latest.sha1(),
-            "可更新: " + (mod.filename != null ? mod.filename.filename() : mod.name) + " -> " + latest.filename(),
-            false, PackRepository.sideName(mod),
-            mod.option != null && mod.option.optional(),
-            mod.option != null && mod.option.defaultValue());
     }
 
     private Path write(CurseForgeSourcer.CurseForgeProjectFile file, String category, String side,
@@ -240,13 +332,6 @@ public class CurseForgeProjectService {
         };
     }
 
-    private String categoryForPath(String metaPath) {
-        if (metaPath == null) return "mods";
-        if (metaPath.startsWith("resourcepacks/")) return "resourcepacks";
-        if (metaPath.startsWith("shaderpacks/")) return "shaderpacks";
-        return "mods";
-    }
-
     public record UpdateResult(
         String metaPath,
         String name,
@@ -255,6 +340,7 @@ public class CurseForgeProjectService {
         int newFileId,
         String newFilename,
         String newSha1,
+        String oldFilename,
         String message,
         boolean pinned,
         String side,
@@ -263,6 +349,24 @@ public class CurseForgeProjectService {
     ) {
         public boolean updateAvailable() {
             return !pinned && projectId > 0 && newFileId > 0 && newFileId != oldFileId;
+        }
+
+        public UpdateResult withFile(CurseForgeSourcer.CurseForgeProjectFile file) {
+            return new UpdateResult(
+                metaPath,
+                name,
+                file.projectId(),
+                oldFileId,
+                file.fileId(),
+                file.filename(),
+                file.sha1(),
+                oldFilename,
+                message,
+                pinned,
+                side,
+                optional,
+                defaultEnabled
+            );
         }
     }
 

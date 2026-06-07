@@ -259,11 +259,20 @@ public class SyncManager {
         // Phase 1: 删除移除的文件
         for (var change : preview.removed) {
             try {
-                Path filePath = resolveInsidePack(packFolder, change.destPath);
-                if (Files.deleteIfExists(filePath)) {
+                ManifestFile.File cached = previousManifestEntry(manifest, packFolder, change.destPath);
+                Path filePath = cached != null && cached.cachedLocation != null
+                    ? resolveInsidePack(packFolder, cached.cachedLocation.path())
+                    : resolveInsidePack(packFolder, change.destPath);
+                boolean deleted = Files.deleteIfExists(filePath);
+                if (!deleted && isDirectModsJar(change.destPath)) {
+                    deleted = Files.deleteIfExists(resolveInsidePack(packFolder, enabledPath(change.destPath)));
+                    deleted |= Files.deleteIfExists(resolveInsidePack(packFolder, disabledPath(change.destPath)));
+                }
+                if (deleted) {
                     Log.info("已删除: " + change.destPath);
                 }
-                manifest.cachedFiles.remove(new PackwizFilePath(packFolder.nioPath(), change.destPath));
+                manifest.cachedFiles.remove(new PackwizFilePath(packFolder.nioPath(), enabledPath(change.destPath)));
+                manifest.cachedFiles.remove(new PackwizFilePath(packFolder.nioPath(), disabledPath(change.destPath)));
                 result.removed.add(change);
             } catch (IOException e) {
                 Log.warn("删除失败: " + change.destPath + " - " + e.getMessage());
@@ -325,13 +334,17 @@ public class SyncManager {
         }
 
         // Phase 3: 并行下载
-        var threadPool = Executors.newFixedThreadPool(10);
+        var threadPool = Executors.newFixedThreadPool(10, runnable -> {
+            Thread thread = new Thread(runnable, "packworkbench-download");
+            thread.setDaemon(true);
+            return thread;
+        });
         var completionService = new ExecutorCompletionService<DownloadTaskResult>(threadPool);
 
         for (var change : downloadTasks) {
             completionService.submit(() -> {
                 try {
-                    downloadFile(change, packFolder, indexFile);
+                    downloadFile(change, packFolder, indexFile, manifest);
                     return new DownloadTaskResult(change, null);
                 } catch (Exception e) {
                     return new DownloadTaskResult(change, e);
@@ -347,7 +360,7 @@ public class SyncManager {
                     IndexFile.FileEntry entry = indexFile != null
                         ? findIndexEntry(indexFile, completedChange.destPath, packFolder) : null;
                     try {
-                        putManifestEntry(manifest, entry, indexFile, packFolder, completedChange.destPath);
+                        putManifestEntry(manifest, entry, indexFile, packFolder, completedChange);
                         cleanupRenamedOldPath(manifest, packFolder, completedChange);
                         String status = completedChange.changeType.equals("added") ? "已新增" : "已更新";
                         addSuccessfulChange(result, completedChange);
@@ -380,7 +393,7 @@ public class SyncManager {
             if (progressCallback != null) progressCallback.accept(completed, "下载完成");
         }
 
-        threadPool.shutdown();
+        threadPool.shutdownNow();
 
         // 保存清单
         manifest.cachedSide = Side.from(config.getSide());
@@ -462,8 +475,14 @@ public class SyncManager {
 
             if (file.cachedLocation != null && !indexDestPaths.contains(relPath)) {
                 try {
-                    Path deletePath = resolveInsidePack(packFolder, relPath);
-                    if (Files.deleteIfExists(deletePath)) {
+                    Path deletePath = file.cachedLocation != null
+                        ? resolveInsidePack(packFolder, file.cachedLocation.path())
+                        : resolveInsidePack(packFolder, relPath);
+                    boolean deleted = Files.deleteIfExists(deletePath);
+                    if (!deleted && isDirectModsJar(relPath)) {
+                        deleted = Files.deleteIfExists(resolveInsidePack(packFolder, disabledPath(relPath)));
+                    }
+                    if (deleted) {
                         Log.info("已清理 (从索引移除): " + relPath);
                         cleaned++;
                     }
@@ -479,13 +498,14 @@ public class SyncManager {
     /**
      * 下载单个文件（含 hash 校验）。
      */
-    private void downloadFile(ModChange change, PackwizFilePath packFolder, IndexFile indexFile) throws Exception {
+    private void downloadFile(ModChange change, PackwizFilePath packFolder, IndexFile indexFile,
+                              ManifestFile manifest) throws Exception {
         // Preserve 检查
         IndexFile.FileEntry entry = indexFile != null ? findIndexEntry(indexFile, change.destPath, packFolder) : null;
+        Path destPath = resolveActualDestPath(packFolder, change, manifest);
         if (entry != null && entry.preserve) {
-            Path destPath = resolveInsidePack(packFolder, change.destPath);
             if (Files.exists(destPath)) {
-                Log.info("跳过 (preserve): " + change.destPath);
+                Log.info("跳过 (preserve): " + relativePath(packFolder, destPath));
                 return;
             }
         }
@@ -495,7 +515,6 @@ public class SyncManager {
             throw new Exception("无法获取下载 URL: " + change.name);
         }
 
-        Path destPath = resolveInsidePack(packFolder, change.destPath);
         Files.createDirectories(destPath.getParent());
         Path tempPath = Files.createTempFile(destPath.getParent(), ".packwiz-download-", ".tmp");
 
@@ -512,6 +531,7 @@ public class SyncManager {
 
             verifyDigest(hashSource.getDigest(), dlInfo.hashFormat(), dlInfo.expectedHash());
             moveReplacing(tempPath, destPath);
+            removeOppositeModsStateFile(packFolder, change.destPath, destPath);
         } catch (Exception e) {
             try { Files.deleteIfExists(tempPath); } catch (IOException ignored) {}
             throw e;
@@ -617,7 +637,9 @@ public class SyncManager {
         String normalized = normalizeRelativePath(destPath);
         if (normalized == null || !normalized.startsWith("mods/")) return false;
         String rest = normalized.substring("mods/".length());
-        return !rest.isEmpty() && !rest.contains("/") && rest.toLowerCase(Locale.ROOT).endsWith(".jar");
+        String lower = rest.toLowerCase(Locale.ROOT);
+        return !rest.isEmpty() && !rest.contains("/")
+            && (lower.endsWith(".jar") || lower.endsWith(".jar.disabled"));
     }
 
     private String relativeDestPath(IndexFile.FileEntry entry, PackwizFilePath packFolder) {
@@ -635,6 +657,75 @@ public class SyncManager {
             throw new IOException("目标路径位于安装目录外: " + destPath);
         }
         return resolved;
+    }
+
+    private String enabledPath(String destPath) {
+        String normalized = normalizeRelativePath(destPath);
+        if (normalized == null) return null;
+        return normalized.toLowerCase(Locale.ROOT).endsWith(".disabled")
+            ? normalized.substring(0, normalized.length() - ".disabled".length())
+            : normalized;
+    }
+
+    private String disabledPath(String destPath) {
+        String enabled = enabledPath(destPath);
+        return enabled == null ? null : enabled + ".disabled";
+    }
+
+    private ManifestFile.File previousManifestEntry(ManifestFile manifest, PackwizFilePath packFolder, String destPath) {
+        synchronized (manifest) {
+            String enabled = enabledPath(destPath);
+            String disabled = disabledPath(destPath);
+            for (String rel : new String[]{enabled, disabled, normalizeRelativePath(destPath)}) {
+                if (rel == null) continue;
+                ManifestFile.File file = manifest.cachedFiles.get(new PackwizFilePath(packFolder.nioPath(), rel));
+                if (file != null) return file;
+            }
+            Set<String> candidates = new HashSet<>();
+            for (String rel : new String[]{enabled, disabled, normalizeRelativePath(destPath)}) {
+                if (rel != null) candidates.add(rel);
+            }
+            for (var entry : manifest.cachedFiles.entrySet()) {
+                ManifestFile.File file = entry.getValue();
+                String cached = file.cachedLocation != null ? normalizeRelativePath(file.cachedLocation.path()) : null;
+                if (cached != null && candidates.contains(cached)) return file;
+            }
+        }
+        return null;
+    }
+
+    private boolean shouldKeepDisabled(ManifestFile manifest, PackwizFilePath packFolder, String destPath) {
+        ManifestFile.File previous = previousManifestEntry(manifest, packFolder, destPath);
+        return previous != null && previous.disabled && isDirectModsJar(destPath);
+    }
+
+    private boolean shouldKeepDisabled(ManifestFile manifest, PackwizFilePath packFolder, ModChange change) {
+        if (change == null) return false;
+        if (shouldKeepDisabled(manifest, packFolder, change.destPath)) return true;
+        return change.oldVersion != null && !change.oldVersion.isBlank()
+            && shouldKeepDisabled(manifest, packFolder, change.oldVersion)
+            && isDirectModsJar(change.destPath);
+    }
+
+    private Path resolveActualDestPath(PackwizFilePath packFolder, ModChange change, ManifestFile manifest) throws IOException {
+        return resolveInsidePack(packFolder, shouldKeepDisabled(manifest, packFolder, change)
+            ? disabledPath(change.destPath)
+            : enabledPath(change.destPath));
+    }
+
+    private String relativePath(PackwizFilePath packFolder, Path path) {
+        Path base = packFolder.nioPath().toAbsolutePath().normalize();
+        Path absolute = path.toAbsolutePath().normalize();
+        if (!absolute.startsWith(base)) return path.toString();
+        return normalizeRelativePath(base.relativize(absolute).toString());
+    }
+
+    private void removeOppositeModsStateFile(PackwizFilePath packFolder, String destPath, Path actualDestPath) throws IOException {
+        if (!isDirectModsJar(destPath)) return;
+        Path enabled = resolveInsidePack(packFolder, enabledPath(destPath));
+        Path disabled = resolveInsidePack(packFolder, disabledPath(destPath));
+        Path opposite = actualDestPath.toAbsolutePath().normalize().equals(enabled.toAbsolutePath().normalize()) ? disabled : enabled;
+        Files.deleteIfExists(opposite);
     }
 
     private ExpectedHash expectedDownloadHash(IndexFile.FileEntry entry, IndexFile indexFile) {
@@ -665,23 +756,25 @@ public class SyncManager {
                                            IndexFile indexFile, PackwizFilePath packFolder) throws Exception {
         if (!isDirectModsJar(change.destPath) || !shouldSync(change.destPath)) return false;
         Path localPath = resolveInsidePack(packFolder, change.destPath);
-        if (!Files.exists(localPath)) return false;
+        Path disabledLocalPath = resolveInsidePack(packFolder, disabledPath(change.destPath));
+        Path actualPath = Files.exists(localPath) ? localPath : disabledLocalPath;
+        if (!Files.exists(actualPath)) return false;
 
         if (entry.preserve) {
-            putManifestEntry(manifest, entry, indexFile, packFolder, change.destPath);
-            Log.info("跳过下载 (preserve): " + change.destPath);
+            putManifestEntry(manifest, entry, indexFile, packFolder, change.destPath, relativePath(packFolder, actualPath));
+            Log.info("跳过下载 (preserve): " + relativePath(packFolder, actualPath));
             return true;
         }
 
         ExpectedHash expected = expectedDownloadHash(entry, indexFile);
-        Hash<?> actual = hashLocalFile(localPath, expected.format());
+        Hash<?> actual = hashLocalFile(actualPath, expected.format());
         Hash<?> expectedHash = expected.format().fromString(expected.hash());
         if (expectedHash.equals(actual)) {
-            putManifestEntry(manifest, entry, indexFile, packFolder, change.destPath);
-            Log.info("跳过下载，文件已存在且 Hash 正确: " + change.destPath);
+            putManifestEntry(manifest, entry, indexFile, packFolder, change.destPath, relativePath(packFolder, actualPath));
+            Log.info("跳过下载，文件已存在且 Hash 正确: " + relativePath(packFolder, actualPath));
             return true;
         }
-        Log.info("本地文件 Hash 不匹配，将重新下载: " + change.destPath);
+        Log.info("本地文件 Hash 不匹配，将重新下载: " + relativePath(packFolder, actualPath));
         return false;
     }
 
@@ -745,22 +838,42 @@ public class SyncManager {
 
     private void putManifestEntry(ManifestFile manifest, IndexFile.FileEntry entry, IndexFile indexFile,
                                   PackwizFilePath packFolder, String destPath) throws IOException {
-        PackwizFilePath key = new PackwizFilePath(packFolder.nioPath(), destPath);
-        ManifestFile.File previous = manifest.cachedFiles.get(key);
-        ManifestFile.File manifestFile = new ManifestFile.File();
-        if (entry != null) {
-            manifestFile.hash = entry.getHashObj(indexFile);
-            manifestFile.linkedFileHash = entry.linkedFile != null && entry.linkedFile.download != null ? entry.linkedFile.getHash() : null;
-            String metaPath = metaFilePath(entry, packFolder);
-            manifestFile.metaFile = metaPath != null ? new PackwizFilePath(packFolder.nioPath(), metaPath) : null;
-            manifestFile.isOptional = entry.linkedFile != null ? entry.linkedFile.option.optional() : entry.optional;
-            manifestFile.optionValue = previous != null ? previous.optionValue
-                : entry.linkedFile != null ? entry.linkedFile.option.defaultValue() : true;
-            manifestFile.onlyOtherSide = false;
+        putManifestEntry(manifest, entry, indexFile, packFolder, destPath,
+            shouldKeepDisabled(manifest, packFolder, destPath) ? disabledPath(destPath) : enabledPath(destPath));
+    }
+
+    private void putManifestEntry(ManifestFile manifest, IndexFile.FileEntry entry, IndexFile indexFile,
+                                  PackwizFilePath packFolder, ModChange change) throws IOException {
+        putManifestEntry(manifest, entry, indexFile, packFolder, change.destPath,
+            shouldKeepDisabled(manifest, packFolder, change) ? disabledPath(change.destPath) : enabledPath(change.destPath));
+    }
+
+    private void putManifestEntry(ManifestFile manifest, IndexFile.FileEntry entry, IndexFile indexFile,
+                                  PackwizFilePath packFolder, String destPath, String actualDestPath) throws IOException {
+        synchronized (manifest) {
+            String enabledDestPath = enabledPath(destPath);
+            String actualPath = normalizeRelativePath(actualDestPath);
+            PackwizFilePath key = new PackwizFilePath(packFolder.nioPath(), enabledDestPath);
+            ManifestFile.File previous = previousManifestEntry(manifest, packFolder, destPath);
+            ManifestFile.File manifestFile = new ManifestFile.File();
+            if (entry != null) {
+                manifestFile.hash = entry.getHashObj(indexFile);
+                manifestFile.linkedFileHash = entry.linkedFile != null && entry.linkedFile.download != null ? entry.linkedFile.getHash() : null;
+                String metaPath = metaFilePath(entry, packFolder);
+                manifestFile.metaFile = metaPath != null ? new PackwizFilePath(packFolder.nioPath(), metaPath) : null;
+                manifestFile.isOptional = entry.linkedFile != null ? entry.linkedFile.option.optional() : entry.optional;
+                manifestFile.optionValue = previous != null ? previous.optionValue
+                    : entry.linkedFile != null ? entry.linkedFile.option.defaultValue() : true;
+                manifestFile.onlyOtherSide = false;
+            }
+            boolean disabled = actualPath != null && actualPath.toLowerCase(Locale.ROOT).endsWith(".disabled");
+            manifestFile.disabled = disabled;
+            manifestFile.cachedLocation = new PackwizFilePath(packFolder.nioPath(), actualPath);
+            resolveInsidePack(packFolder, enabledDestPath);
+            resolveInsidePack(packFolder, actualPath);
+            manifest.cachedFiles.remove(new PackwizFilePath(packFolder.nioPath(), disabledPath(enabledDestPath)));
+            manifest.cachedFiles.put(key, manifestFile);
         }
-        resolveInsidePack(packFolder, destPath);
-        manifestFile.cachedLocation = key;
-        manifest.cachedFiles.put(key, manifestFile);
     }
 
     private void cleanupRenamedOldPath(ManifestFile manifest, PackwizFilePath packFolder, ModChange change) {
@@ -770,10 +883,14 @@ public class SyncManager {
         if (oldPath == null || oldPath.equals(newPath)) return;
         try {
             Files.deleteIfExists(resolveInsidePack(packFolder, oldPath));
+            Files.deleteIfExists(resolveInsidePack(packFolder, disabledPath(oldPath)));
         } catch (IOException e) {
             Log.warn("删除旧版本文件失败: " + oldPath + " - " + e.getMessage());
         }
-        manifest.cachedFiles.remove(new PackwizFilePath(packFolder.nioPath(), oldPath));
+        synchronized (manifest) {
+            manifest.cachedFiles.remove(new PackwizFilePath(packFolder.nioPath(), oldPath));
+            manifest.cachedFiles.remove(new PackwizFilePath(packFolder.nioPath(), disabledPath(oldPath)));
+        }
     }
 
     private void addSuccessfulChange(SyncResult result, ModChange change) {
