@@ -6,21 +6,44 @@ import link.infra.packwiz.installer.project.CurseForgeProjectService;
 import javax.swing.*;
 import javax.swing.table.AbstractTableModel;
 import javax.swing.table.DefaultTableCellRenderer;
+import javax.swing.text.html.HTMLEditorKit;
+import javax.swing.text.html.StyleSheet;
 import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public class UpdateSelectionWindow extends JDialog {
+    private static final int CHANGELOG_COLUMN = 0;
+    private static final int SELECT_COLUMN = 1;
+    private static final String COLLAPSED_MARK = "\u25b6";
+    private static final String EXPANDED_MARK = "\u25bc";
+    private static final String EMPTY_CHANGELOG = "<html><body><p>点击更新行左侧三角查看更新日志。</p></body></html>";
+
+    private final CurseForgeProjectService service;
     private final UpdateTableModel model;
+    private final Map<String, String> changelogCache = new HashMap<>();
+    private final Set<String> loadingKeys = new HashSet<>();
+    private JTable table;
+    private JLabel changelogTitle;
+    private JEditorPane changelogPane;
+    private int expandedRow = -1;
     private boolean confirmed = false;
 
-    public UpdateSelectionWindow(Window owner, List<CurseForgeProjectService.UpdateResult> results) {
+    public UpdateSelectionWindow(Window owner, List<CurseForgeProjectService.UpdateResult> results,
+                                 CurseForgeProjectService service) {
         super(owner, "批量更新", ModalityType.APPLICATION_MODAL);
+        this.service = service;
         this.model = new UpdateTableModel(results);
         setDefaultCloseOperation(DISPOSE_ON_CLOSE);
         buildUI();
-        setMinimumSize(new Dimension(980, 420));
-        setSize(1180, 580);
+        setMinimumSize(new Dimension(980, 520));
+        setSize(1180, 720);
         setLocationRelativeTo(owner);
     }
 
@@ -36,9 +59,9 @@ public class UpdateSelectionWindow extends JDialog {
         title.putClientProperty(FlatClientProperties.STYLE_CLASS, "h2");
         root.add(title, BorderLayout.NORTH);
 
-        JTable table = new JTable(model) {
+        table = new JTable(model) {
             @Override
-            public String getToolTipText(java.awt.event.MouseEvent event) {
+            public String getToolTipText(MouseEvent event) {
                 int viewRow = rowAtPoint(event.getPoint());
                 if (viewRow < 0) return null;
                 return model.tooltip(convertRowIndexToModel(viewRow));
@@ -48,19 +71,34 @@ public class UpdateSelectionWindow extends JDialog {
         table.setAutoResizeMode(JTable.AUTO_RESIZE_SUBSEQUENT_COLUMNS);
         table.setRowHeight(28);
         table.setFillsViewportHeight(true);
+        table.getTableHeader().setReorderingAllowed(false);
         table.putClientProperty(FlatClientProperties.STYLE, "showHorizontalLines: true; showVerticalLines: false");
-        table.getColumnModel().getColumn(0).setMinWidth(44);
-        table.getColumnModel().getColumn(0).setPreferredWidth(48);
-        table.getColumnModel().getColumn(0).setMaxWidth(56);
-        table.getColumnModel().getColumn(1).setPreferredWidth(240);
-        table.getColumnModel().getColumn(2).setPreferredWidth(430);
-        table.getColumnModel().getColumn(3).setPreferredWidth(430);
         table.setDefaultRenderer(String.class, new CompactCellRenderer());
+        table.getColumnModel().getColumn(CHANGELOG_COLUMN).setMinWidth(42);
+        table.getColumnModel().getColumn(CHANGELOG_COLUMN).setPreferredWidth(46);
+        table.getColumnModel().getColumn(CHANGELOG_COLUMN).setMaxWidth(54);
+        table.getColumnModel().getColumn(SELECT_COLUMN).setMinWidth(44);
+        table.getColumnModel().getColumn(SELECT_COLUMN).setPreferredWidth(48);
+        table.getColumnModel().getColumn(SELECT_COLUMN).setMaxWidth(56);
+        table.getColumnModel().getColumn(2).setPreferredWidth(220);
+        table.getColumnModel().getColumn(3).setPreferredWidth(380);
+        table.getColumnModel().getColumn(4).setPreferredWidth(380);
+        table.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent event) {
+                handleTableClick(event);
+            }
+        });
 
-        JScrollPane scroll = new JScrollPane(table);
-        scroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS);
-        scroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
-        root.add(scroll, BorderLayout.CENTER);
+        JScrollPane tableScroll = new JScrollPane(table);
+        tableScroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS);
+        tableScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+
+        JPanel changelogPanel = buildChangelogPanel();
+        var split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tableScroll, changelogPanel);
+        split.setResizeWeight(0.60);
+        split.setBorder(BorderFactory.createEmptyBorder());
+        root.add(split, BorderLayout.CENTER);
 
         JButton all = new JButton("全选可更新");
         all.addActionListener(e -> model.selectAllAvailable());
@@ -87,8 +125,144 @@ public class UpdateSelectionWindow extends JDialog {
         setContentPane(root);
     }
 
+    private JPanel buildChangelogPanel() {
+        changelogTitle = new JLabel("更新日志");
+        changelogTitle.putClientProperty(FlatClientProperties.STYLE_CLASS, "h3");
+
+        changelogPane = new JEditorPane();
+        changelogPane.setEditable(false);
+        changelogPane.setContentType("text/html");
+        changelogPane.setEditorKit(htmlKit());
+        changelogPane.setText(EMPTY_CHANGELOG);
+        changelogPane.setCaretPosition(0);
+
+        var panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(1, 0, 0, 0, borderColor()),
+            BorderFactory.createEmptyBorder(10, 0, 0, 0)
+        ));
+        panel.add(changelogTitle, BorderLayout.NORTH);
+        panel.add(new JScrollPane(changelogPane), BorderLayout.CENTER);
+        return panel;
+    }
+
+    private Color borderColor() {
+        Color color = UIManager.getColor("Component.borderColor");
+        return color != null ? color : UIManager.getColor("Separator.foreground");
+    }
+
+    private HTMLEditorKit htmlKit() {
+        var kit = new HTMLEditorKit();
+        StyleSheet styles = kit.getStyleSheet();
+        Font font = UIManager.getFont("Label.font");
+        if (font != null) {
+            styles.addRule("body { font-family: " + font.getFamily() + "; font-size: " + font.getSize() + "pt; padding: 8px; }");
+        } else {
+            styles.addRule("body { padding: 8px; }");
+        }
+        styles.addRule("p, li { margin-bottom: 6px; }");
+        styles.addRule("code, pre { font-family: Monospaced; }");
+        return kit;
+    }
+
+    private void handleTableClick(MouseEvent event) {
+        int viewRow = table.rowAtPoint(event.getPoint());
+        int viewColumn = table.columnAtPoint(event.getPoint());
+        if (viewRow < 0 || viewColumn != CHANGELOG_COLUMN) return;
+        int modelRow = table.convertRowIndexToModel(viewRow);
+        toggleChangelog(modelRow);
+    }
+
+    private void toggleChangelog(int modelRow) {
+        if (modelRow < 0 || modelRow >= model.getRowCount()) return;
+        if (expandedRow == modelRow) {
+            expandedRow = -1;
+            model.setExpandedRow(expandedRow);
+            changelogTitle.setText("更新日志");
+            showHtml(EMPTY_CHANGELOG);
+            model.fireTableRowsUpdated(modelRow, modelRow);
+            return;
+        }
+
+        int oldExpanded = expandedRow;
+        expandedRow = modelRow;
+        model.setExpandedRow(expandedRow);
+        if (oldExpanded >= 0) model.fireTableRowsUpdated(oldExpanded, oldExpanded);
+        model.fireTableRowsUpdated(modelRow, modelRow);
+
+        var result = model.resultAt(modelRow);
+        changelogTitle.setText("更新日志 - " + result.name() + " / " + result.newFilename());
+        String key = cacheKey(result);
+        if (changelogCache.containsKey(key)) {
+            showChangelog(changelogCache.get(key));
+            return;
+        }
+        if (loadingKeys.contains(key)) {
+            showLoading();
+            return;
+        }
+        loadChangelog(modelRow, result, key);
+    }
+
+    private void loadChangelog(int modelRow, CurseForgeProjectService.UpdateResult result, String key) {
+        loadingKeys.add(key);
+        showLoading();
+        new SwingWorker<String, Void>() {
+            @Override
+            protected String doInBackground() throws Exception {
+                return service.loadUpdateChangelog(result);
+            }
+
+            @Override
+            protected void done() {
+                loadingKeys.remove(key);
+                try {
+                    String html = get();
+                    changelogCache.put(key, html);
+                    if (expandedRow == modelRow) showChangelog(html);
+                } catch (Exception e) {
+                    String message = e.getCause() != null ? e.getCause().getMessage() : e.getMessage();
+                    String html = "<p>加载更新日志失败：" + escapeHtml(message != null ? message : e.getClass().getSimpleName()) + "</p>";
+                    changelogCache.put(key, html);
+                    if (expandedRow == modelRow) showHtml(wrapHtml(html));
+                }
+            }
+        }.execute();
+    }
+
+    private void showLoading() {
+        showHtml("<html><body><p>正在加载更新日志...</p></body></html>");
+    }
+
+    private void showChangelog(String html) {
+        showHtml(wrapHtml(html == null || html.isBlank() ? "<p>该文件没有提供更新日志。</p>" : html));
+    }
+
+    private void showHtml(String html) {
+        changelogPane.setText(html);
+        changelogPane.setCaretPosition(0);
+    }
+
+    private String wrapHtml(String html) {
+        String trimmed = html == null ? "" : html.trim();
+        if (trimmed.regionMatches(true, 0, "<html", 0, 5)) return trimmed;
+        return "<html><body>" + trimmed + "</body></html>";
+    }
+
+    private String cacheKey(CurseForgeProjectService.UpdateResult result) {
+        return result.projectId() + ":" + result.newFileId();
+    }
+
+    private static String escapeHtml(String value) {
+        return value == null ? "" : value
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;");
+    }
+
     private static class UpdateTableModel extends AbstractTableModel {
-        private final String[] columns = {"", "Mod", "当前", "即将更新"};
+        private final String[] columns = {"日志", "选择", "Mod", "当前", "即将更新"};
         private final List<Row> rows;
 
         UpdateTableModel(List<CurseForgeProjectService.UpdateResult> results) {
@@ -103,6 +277,10 @@ public class UpdateSelectionWindow extends JDialog {
             int count = 0;
             for (var row : rows) if (row.result.updateAvailable()) count++;
             return count;
+        }
+
+        CurseForgeProjectService.UpdateResult resultAt(int rowIndex) {
+            return rows.get(rowIndex).result;
         }
 
         List<CurseForgeProjectService.UpdateResult> selectedUpdates() {
@@ -127,21 +305,28 @@ public class UpdateSelectionWindow extends JDialog {
         @Override public int getColumnCount() { return columns.length; }
         @Override public String getColumnName(int column) { return columns[column]; }
         @Override public Class<?> getColumnClass(int columnIndex) {
-            return columnIndex == 0 ? Boolean.class : String.class;
+            return columnIndex == SELECT_COLUMN ? Boolean.class : String.class;
         }
         @Override public boolean isCellEditable(int rowIndex, int columnIndex) {
-            return columnIndex == 0 && rows.get(rowIndex).result.updateAvailable();
+            return columnIndex == SELECT_COLUMN && rows.get(rowIndex).result.updateAvailable();
         }
         @Override public Object getValueAt(int rowIndex, int columnIndex) {
             Row row = rows.get(rowIndex);
             var result = row.result;
             return switch (columnIndex) {
-                case 0 -> row.selected;
-                case 1 -> result.name();
-                case 2 -> result.oldFilename();
-                case 3 -> result.updateAvailable() ? result.newFilename() : "";
+                case CHANGELOG_COLUMN -> rowIndex == expandedRowHolder ? EXPANDED_MARK : COLLAPSED_MARK;
+                case SELECT_COLUMN -> row.selected;
+                case 2 -> result.name();
+                case 3 -> result.oldFilename();
+                case 4 -> result.updateAvailable() ? result.newFilename() : "";
                 default -> "";
             };
+        }
+
+        private int expandedRowHolder = -1;
+
+        void setExpandedRow(int expandedRow) {
+            this.expandedRowHolder = expandedRow;
         }
 
         String tooltip(int rowIndex) {
@@ -154,21 +339,21 @@ public class UpdateSelectionWindow extends JDialog {
         }
 
         @Override public void setValueAt(Object value, int rowIndex, int columnIndex) {
-            if (columnIndex != 0) return;
+            if (columnIndex != SELECT_COLUMN) return;
             Row row = rows.get(rowIndex);
             row.selected = row.result.updateAvailable() && Boolean.TRUE.equals(value);
             fireTableCellUpdated(rowIndex, columnIndex);
         }
     }
 
-    private static class CompactCellRenderer extends DefaultTableCellRenderer {
+    private class CompactCellRenderer extends DefaultTableCellRenderer {
         @Override
         public Component getTableCellRendererComponent(JTable table, Object value, boolean selected, boolean focus,
                                                        int row, int column) {
             JLabel label = (JLabel) super.getTableCellRendererComponent(table, value, selected, focus, row, column);
             label.setBorder(BorderFactory.createEmptyBorder(0, 6, 0, 6));
             label.setToolTipText(value != null ? value.toString() : null);
-            label.setHorizontalAlignment(SwingConstants.LEFT);
+            label.setHorizontalAlignment(column == CHANGELOG_COLUMN ? SwingConstants.CENTER : SwingConstants.LEFT);
             return label;
         }
     }

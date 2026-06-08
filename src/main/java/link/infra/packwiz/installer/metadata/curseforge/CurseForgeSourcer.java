@@ -52,6 +52,10 @@ public class CurseForgeSourcer {
         List<CfMod> data = new ArrayList<>();
     }
 
+    private static class ChangelogResponse {
+        String data = "";
+    }
+
     public record CurseForgeFileMetadata(
         int projectId,
         int fileId,
@@ -136,6 +140,28 @@ public class CurseForgeSourcer {
             ));
         }
         return out;
+    }
+
+    public static String getFileChangelog(int projectId, int fileId, ClientHolder clientHolder) throws Exception {
+        if (projectId <= 0 || fileId <= 0) {
+            throw new IOException("CurseForge 更新日志请求缺少项目或文件 ID");
+        }
+        String endpoint = "/v1/mods/" + projectId + "/files/" + fileId + "/changelog";
+        HttpResponse<InputStream> res = clientHolder.httpRequest(buildCfApiGetRequest(endpoint));
+        if (res.statusCode() < 200 || res.statusCode() >= 300 || res.body() == null) {
+            try { if (res.body() != null) res.body().close(); } catch (IOException ignored) {}
+            if (res.statusCode() == 404) {
+                throw new IOException("CurseForge 未找到该文件的更新日志");
+            }
+            throw new IOException("CurseForge 更新日志查询失败: HTTP " + res.statusCode());
+        }
+        try (var body = res.body()) {
+            ChangelogResponse data = GSON.fromJson(new InputStreamReader(body, StandardCharsets.UTF_8), ChangelogResponse.class);
+            if (data == null || data.data == null || data.data.isBlank()) {
+                return "<p>该文件没有提供更新日志。</p>";
+            }
+            return data.data;
+        }
     }
 
     private static CurseForgeFileMetadata toFileMetadata(CfFile file) {
@@ -690,6 +716,7 @@ public class CurseForgeSourcer {
         int fileId;
         String filename;
         String gameVersion;
+        int releaseType = RELEASE;
         int modLoader;
     }
 

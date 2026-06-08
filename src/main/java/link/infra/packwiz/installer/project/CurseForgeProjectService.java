@@ -196,6 +196,15 @@ public class CurseForgeProjectService {
         new IndexRefresher(repository).refreshAndWrite();
     }
 
+    public String loadUpdateChangelog(UpdateResult update) throws Exception {
+        if (update == null || !update.updateAvailable()) {
+            throw new IllegalArgumentException("该条目没有可加载的 CurseForge 更新日志");
+        }
+        try (var holder = new CloseableClientHolder()) {
+            return CurseForgeSourcer.getFileChangelog(update.projectId(), update.newFileId(), holder.client());
+        }
+    }
+
     private UpdateResult checkUpdate(IndexFile.FileEntry entry, PackFile pack, ClientHolder holder) throws Exception {
         ModFile mod = entry.linkedFile;
         if (mod == null || mod.update.get("curseforge") == null) return null;
@@ -309,8 +318,17 @@ public class CurseForgeProjectService {
 
     private List<String> loaders(PackFile pack) {
         var loaders = new ArrayList<String>();
-        for (String key : List.of("neoforge", "quilt", "fabric", "forge")) {
-            if (pack.versions.containsKey(key)) loaders.add(key);
+        if (pack.versions.containsKey("quilt")) {
+            loaders.add("quilt");
+            loaders.add("fabric");
+        } else if (pack.versions.containsKey("fabric")) {
+            loaders.add("fabric");
+        }
+        if (pack.versions.containsKey("neoforge")) {
+            loaders.add("neoforge");
+            loaders.add("forge");
+        } else if (pack.versions.containsKey("forge")) {
+            loaders.add("forge");
         }
         return loaders;
     }

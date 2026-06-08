@@ -770,11 +770,11 @@ public class WorkbenchWindow extends JFrame {
         runBackground("批量检查更新", () -> {
             var service = new CurseForgeProjectService(repository);
             var results = service.checkAllUpdates();
-            SwingUtilities.invokeLater(() -> showBatchUpdateWindow(results));
+            SwingUtilities.invokeLater(() -> showBatchUpdateWindow(results, service));
         });
     }
 
-    private void showBatchUpdateWindow(List<CurseForgeProjectService.UpdateResult> results) {
+    private void showBatchUpdateWindow(List<CurseForgeProjectService.UpdateResult> results, CurseForgeProjectService service) {
         if (results.isEmpty()) {
             JOptionPane.showMessageDialog(this, "没有可检查的 CurseForge 条目。", "批量检查更新", JOptionPane.INFORMATION_MESSAGE);
             return;
@@ -784,7 +784,7 @@ public class WorkbenchWindow extends JFrame {
             JOptionPane.showMessageDialog(this, "没有可更新的 CurseForge 条目。", "批量检查更新", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        var dialog = new UpdateSelectionWindow(this, results);
+        var dialog = new UpdateSelectionWindow(this, results, service);
         dialog.setVisible(true);
         var selected = dialog.selectedUpdates();
         if (selected.isEmpty()) return;
