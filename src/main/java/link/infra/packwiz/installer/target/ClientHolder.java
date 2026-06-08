@@ -10,18 +10,30 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.time.Duration;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
-public class ClientHolder {
+public class ClientHolder implements AutoCloseable {
     private static final Duration[] RETRY_TIMEOUTS = {
         Duration.ofSeconds(10), Duration.ofSeconds(15), Duration.ofSeconds(60)
     };
 
     private final HttpClient httpClient;
+    private final ExecutorService executor;
 
     public ClientHolder() {
+        AtomicInteger threadId = new AtomicInteger();
+        this.executor = Executors.newCachedThreadPool(runnable -> {
+            Thread thread = new Thread(runnable, "packworkbench-http-" + threadId.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        });
         this.httpClient = HttpClient.newBuilder()
             .connectTimeout(RETRY_TIMEOUTS[0])
             .followRedirects(HttpClient.Redirect.NORMAL)
+            .executor(executor)
             .build();
     }
 
@@ -83,7 +95,16 @@ public class ClientHolder {
         throw new RequestException.Internal.HTTP.RequestFailed(lastException);
     }
 
+    @Override
     public void close() {
-        // HttpClient is lightweight, GC handles cleanup
+        httpClient.close();
+        executor.shutdownNow();
+        try {
+            if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+                Log.warn("HTTP 线程池未能在超时时间内完全停止");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

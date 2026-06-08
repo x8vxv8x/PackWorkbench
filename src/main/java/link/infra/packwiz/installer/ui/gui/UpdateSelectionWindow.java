@@ -27,6 +27,7 @@ public class UpdateSelectionWindow extends JDialog {
 
     private final CurseForgeProjectService service;
     private final UpdateTableModel model;
+    private final boolean compact;
     private final Map<String, String> changelogCache = new HashMap<>();
     private final Set<String> loadingKeys = new HashSet<>();
     private JTable table;
@@ -37,13 +38,29 @@ public class UpdateSelectionWindow extends JDialog {
 
     public UpdateSelectionWindow(Window owner, List<CurseForgeProjectService.UpdateResult> results,
                                  CurseForgeProjectService service) {
-        super(owner, "批量更新", ModalityType.APPLICATION_MODAL);
+        this(owner, "批量更新", results, service);
+    }
+
+    public UpdateSelectionWindow(Window owner, String title, List<CurseForgeProjectService.UpdateResult> results,
+                                 CurseForgeProjectService service) {
+        this(owner, title, results, service, false);
+    }
+
+    public UpdateSelectionWindow(Window owner, String title, List<CurseForgeProjectService.UpdateResult> results,
+                                 CurseForgeProjectService service, boolean compact) {
+        super(owner, title, ModalityType.APPLICATION_MODAL);
         this.service = service;
         this.model = new UpdateTableModel(results);
+        this.compact = compact;
         setDefaultCloseOperation(DISPOSE_ON_CLOSE);
         buildUI();
-        setMinimumSize(new Dimension(980, 520));
-        setSize(1180, 720);
+        if (compact) {
+            setMinimumSize(new Dimension(760, 360));
+            setSize(900, 460);
+        } else {
+            setMinimumSize(new Dimension(980, 520));
+            setSize(1180, 720);
+        }
         setLocationRelativeTo(owner);
     }
 
@@ -52,11 +69,11 @@ public class UpdateSelectionWindow extends JDialog {
     }
 
     private void buildUI() {
-        var root = new JPanel(new BorderLayout(10, 10));
-        root.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+        var root = new JPanel(new BorderLayout(8, 8));
+        root.setBorder(BorderFactory.createEmptyBorder(compact ? 10 : 12, 12, compact ? 10 : 12, 12));
 
         JLabel title = new JLabel("可更新 " + model.updateCount() + " 个");
-        title.putClientProperty(FlatClientProperties.STYLE_CLASS, "h2");
+        title.putClientProperty(FlatClientProperties.STYLE_CLASS, compact ? "h3" : "h2");
         root.add(title, BorderLayout.NORTH);
 
         table = new JTable(model) {
@@ -69,8 +86,8 @@ public class UpdateSelectionWindow extends JDialog {
         };
         table.setAutoCreateRowSorter(true);
         table.setAutoResizeMode(JTable.AUTO_RESIZE_SUBSEQUENT_COLUMNS);
-        table.setRowHeight(28);
-        table.setFillsViewportHeight(true);
+        table.setRowHeight(compact ? 26 : 28);
+        table.setFillsViewportHeight(!compact);
         table.getTableHeader().setReorderingAllowed(false);
         table.putClientProperty(FlatClientProperties.STYLE, "showHorizontalLines: true; showVerticalLines: false");
         table.setDefaultRenderer(String.class, new CompactCellRenderer());
@@ -91,13 +108,23 @@ public class UpdateSelectionWindow extends JDialog {
         });
 
         JScrollPane tableScroll = new JScrollPane(table);
-        tableScroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS);
+        tableScroll.setVerticalScrollBarPolicy(compact
+            ? ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED
+            : ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS);
         tableScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        if (compact) {
+            tableScroll.setPreferredSize(new Dimension(0, 72));
+        }
 
         JPanel changelogPanel = buildChangelogPanel();
         var split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tableScroll, changelogPanel);
-        split.setResizeWeight(0.60);
+        split.setResizeWeight(compact ? 0.15 : 0.46);
         split.setBorder(BorderFactory.createEmptyBorder());
+        if (compact) {
+            split.setDividerLocation(78);
+        } else {
+            split.setDividerLocation(300);
+        }
         root.add(split, BorderLayout.CENTER);
 
         JButton all = new JButton("全选可更新");
@@ -117,12 +144,18 @@ public class UpdateSelectionWindow extends JDialog {
         close.addActionListener(e -> dispose());
 
         var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
-        buttons.add(all);
-        buttons.add(none);
+        if (!compact) {
+            buttons.add(all);
+            buttons.add(none);
+        }
         buttons.add(close);
         buttons.add(apply);
         root.add(buttons, BorderLayout.SOUTH);
         setContentPane(root);
+
+        if (compact && model.getRowCount() == 1) {
+            SwingUtilities.invokeLater(() -> toggleChangelog(0));
+        }
     }
 
     private JPanel buildChangelogPanel() {

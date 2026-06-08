@@ -373,7 +373,7 @@ public class SetupWindow extends JFrame {
         }
 
         // 在后台线程执行同步检查
-        new Thread(() -> {
+        startDaemonThread("packworkbench-setup-sync-check", () -> {
             try {
                 var syncManager = new link.infra.packwiz.installer.sync.SyncManager(config, rootDir);
                 var preview = syncManager.checkForChanges();
@@ -402,7 +402,7 @@ public class SetupWindow extends JFrame {
                         progressDialog.setMaximum(Math.max(totalTasks, 1));
                         progressDialog.setVisible(true);
 
-                        new Thread(() -> {
+                        startDaemonThread("packworkbench-setup-sync-execute", () -> {
                             try {
                                 var result = syncManager.executeSync(preview, (completed, status) -> {
                                     SwingUtilities.invokeLater(() -> progressDialog.updateProgress(completed, status));
@@ -415,7 +415,7 @@ public class SetupWindow extends JFrame {
                             } finally {
                                 syncManager.close();
                             }
-                        }).start();
+                        });
                     }
                 });
 
@@ -431,7 +431,13 @@ public class SetupWindow extends JFrame {
             } finally {
                 SwingUtilities.invokeLater(() -> setEnabled(true));
             }
-        }).start();
+        });
+    }
+
+    private void startDaemonThread(String name, Runnable task) {
+        Thread thread = new Thread(task, name);
+        thread.setDaemon(true);
+        thread.start();
     }
 
     /** 简单的进度对话框 */

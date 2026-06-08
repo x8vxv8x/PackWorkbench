@@ -195,16 +195,21 @@ public class SyncManager {
             String downloadHash = dlInfo != null ? dlInfo.expectedHash() : "";
             String indexHash = fileEntry.hash;
 
-            // 在 manifest 中查找对应的条目
-            PackwizFilePath manifestKey = new PackwizFilePath(packFolder.nioPath(), destPath);
-            ManifestFile.File manifestFile = manifest.cachedFiles.get(manifestKey);
+            // 在 manifest 中查找对应条目；禁用的 mods/*.jar 会以 enabled key + disabled cachedLocation 保存。
+            ManifestFile.File manifestFile = previousManifestEntry(manifest, packFolder, destPath);
             if (manifestFile == null) {
-                result.added.add(new ModChange(modName, destPath, downloadUrl, downloadHash, "added"));
+                var change = new ModChange(modName, destPath, downloadUrl, downloadHash, "added");
+                if (!tryRecordExistingModsJar(change, fileEntry, manifest, indexFile, packFolder, "新增")) {
+                    result.added.add(change);
+                }
             } else if (invalidateAll
                 || invalidatedPaths.contains(normalizeRelativePath(destPath))
                 || !indexHash.equals(manifestFile.hash != null ? manifestFile.hash.toString() : "")) {
-                result.updated.add(new ModChange(modName, destPath, downloadUrl, downloadHash, "updated",
-                    "", "", modName));
+                var change = new ModChange(modName, destPath, downloadUrl, downloadHash, "updated",
+                    "", "", modName);
+                if (!tryRecordExistingModsJar(change, fileEntry, manifest, indexFile, packFolder, "更新")) {
+                    result.updated.add(change);
+                }
             }
         }
 
@@ -222,6 +227,13 @@ public class SyncManager {
         }
 
         foldRenamedUpdates(result, indexMap, manifest, packFolder);
+
+        if (!metadataReadFailed && result.added.isEmpty() && result.updated.isEmpty() && result.removed.isEmpty()) {
+            manifest.packFileHash = currentPackHash;
+            manifest.cachedSide = Side.from(config.getSide());
+            manifest.save(manifestPath, packFolder);
+            result.unchanged = true;
+        }
 
         return result;
     }
@@ -776,6 +788,32 @@ public class SyncManager {
         }
         Log.info("本地文件 Hash 不匹配，将重新下载: " + relativePath(packFolder, actualPath));
         return false;
+    }
+
+    private boolean tryRecordExistingModsJar(ModChange change, IndexFile.FileEntry entry, ManifestFile manifest,
+                                             IndexFile indexFile, PackwizFilePath packFolder, String action) {
+        try {
+            if (!isDirectModsJar(change.destPath) || !shouldSync(change.destPath)) return false;
+            Path enabledLocalPath = resolveInsidePack(packFolder, enabledPath(change.destPath));
+            Path disabledLocalPath = resolveInsidePack(packFolder, disabledPath(change.destPath));
+            Path actualPath = Files.exists(enabledLocalPath) ? enabledLocalPath : disabledLocalPath;
+            if (!Files.exists(actualPath)) return false;
+
+            if (!entry.preserve) {
+                ExpectedHash expected = expectedDownloadHash(entry, indexFile);
+                Hash<?> actual = hashLocalFile(actualPath, expected.format());
+                Hash<?> expectedHash = expected.format().fromString(expected.hash());
+                if (!expectedHash.equals(actual)) return false;
+            }
+
+            putManifestEntry(manifest, entry, indexFile, packFolder, change.destPath, relativePath(packFolder, actualPath));
+            manifest.save(InstallerConfig.getManifestFile(rootDir), packFolder);
+            Log.info("跳过" + action + "，本地文件已存在且 Hash 正确: " + relativePath(packFolder, actualPath));
+            return true;
+        } catch (Exception e) {
+            Log.warn("检查本地文件失败，将继续同步: " + change.destPath + " - " + e.getMessage());
+            return false;
+        }
     }
 
     private void foldRenamedUpdates(SyncResult result, Map<String, IndexFile.FileEntry> indexMap,

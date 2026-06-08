@@ -345,8 +345,6 @@ public class WorkbenchWindow extends JFrame {
         unpin.addActionListener(e -> pinSelected(table, model, false));
         var check = new JMenuItem("检查更新");
         check.addActionListener(e -> checkSelectedUpdate(table, model));
-        var apply = new JMenuItem("检查并应用更新");
-        apply.addActionListener(e -> applySelectedUpdate(table, model));
         menu.addPopupMenuListener(new javax.swing.event.PopupMenuListener() {
             @Override public void popupMenuWillBecomeVisible(javax.swing.event.PopupMenuEvent e) {
                 AssetRow row = selectedRow(table, model);
@@ -354,7 +352,6 @@ public class WorkbenchWindow extends JFrame {
                 pin.setEnabled(curseForge && !row.locked());
                 unpin.setEnabled(curseForge && row.locked());
                 check.setEnabled(curseForge);
-                apply.setEnabled(curseForge);
                 delete.setEnabled(row != null);
                 deleteFile.setEnabled(row != null && row.actualFile() != null);
                 toggle.setEnabled(row != null && row.type().equals("mod") && row.actualFile() != null && row.toggleTarget() != null);
@@ -373,7 +370,6 @@ public class WorkbenchWindow extends JFrame {
         menu.add(unpin);
         menu.addSeparator();
         menu.add(check);
-        menu.add(apply);
         return menu;
     }
 
@@ -620,26 +616,14 @@ public class WorkbenchWindow extends JFrame {
         AssetRow row = selectedRow(table, model);
         if (row == null || !row.curseForge() || row.entry() == null) return;
         runBackground("检查更新", () -> {
-            var result = new CurseForgeProjectService(repository).checkSingleUpdate(row.entry());
-            String message = result == null ? "该条目没有 CurseForge 更新源" : result.message();
-            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this, message, "检查更新", JOptionPane.INFORMATION_MESSAGE));
-        });
-    }
-
-    private void applySelectedUpdate(JTable table, AssetTableModel model) {
-        AssetRow row = selectedRow(table, model);
-        if (row == null || !row.curseForge() || row.entry() == null) return;
-        runBackground("应用更新", () -> {
             var service = new CurseForgeProjectService(repository);
             var result = service.checkSingleUpdate(row.entry());
-            if (result == null || !result.updateAvailable()) {
-                SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
-                    result == null ? "该条目没有 CurseForge 更新源" : result.message(),
-                    "应用更新", JOptionPane.INFORMATION_MESSAGE));
-                return;
-            }
-            service.applyUpdate(result);
-            SwingUtilities.invokeLater(this::reloadProject);
+            SwingUtilities.invokeLater(() -> showUpdateWindow(
+                result == null ? List.of() : List.of(result),
+                service,
+                "检查更新",
+                false
+            ));
         });
     }
 
@@ -770,27 +754,38 @@ public class WorkbenchWindow extends JFrame {
         runBackground("批量检查更新", () -> {
             var service = new CurseForgeProjectService(repository);
             var results = service.checkAllUpdates();
-            SwingUtilities.invokeLater(() -> showBatchUpdateWindow(results, service));
+            SwingUtilities.invokeLater(() -> showUpdateWindow(results, service, "批量更新", true));
         });
     }
 
-    private void showBatchUpdateWindow(List<CurseForgeProjectService.UpdateResult> results, CurseForgeProjectService service) {
+    private void showUpdateWindow(List<CurseForgeProjectService.UpdateResult> results,
+                                  CurseForgeProjectService service,
+                                  String title,
+                                  boolean batch) {
         if (results.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "没有可检查的 CurseForge 条目。", "批量检查更新", JOptionPane.INFORMATION_MESSAGE);
+            JOptionPane.showMessageDialog(this, "没有可检查的 CurseForge 条目。", title, JOptionPane.INFORMATION_MESSAGE);
             return;
         }
         boolean hasUpdates = results.stream().anyMatch(CurseForgeProjectService.UpdateResult::updateAvailable);
         if (!hasUpdates) {
-            JOptionPane.showMessageDialog(this, "没有可更新的 CurseForge 条目。", "批量检查更新", JOptionPane.INFORMATION_MESSAGE);
+            String message = results.size() == 1 ? results.get(0).message() : "没有可更新的 CurseForge 条目。";
+            JOptionPane.showMessageDialog(this, message, title, JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        var dialog = new UpdateSelectionWindow(this, results, service);
+        var dialog = new UpdateSelectionWindow(this, title, results, service, !batch);
         dialog.setVisible(true);
         var selected = dialog.selectedUpdates();
         if (selected.isEmpty()) return;
-        runBackground("批量应用更新", () -> {
+        String taskTitle = batch ? "批量应用更新" : "应用更新";
+        runBackground(taskTitle, () -> {
             new CurseForgeProjectService(repository).applyUpdates(selected);
-            SwingUtilities.invokeLater(this::reloadProject);
+            Log.info(taskTitle + "完成: " + selected.size() + " 个");
+            SwingUtilities.invokeLater(() -> {
+                reloadProject();
+                JOptionPane.showMessageDialog(this,
+                    "已应用更新: " + selected.size() + " 个\n请执行下载同步以获取新的文件。",
+                    title, JOptionPane.INFORMATION_MESSAGE);
+            });
         });
     }
 
