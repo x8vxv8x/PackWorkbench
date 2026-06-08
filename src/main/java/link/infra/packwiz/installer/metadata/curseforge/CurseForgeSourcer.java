@@ -288,7 +288,7 @@ public class CurseForgeSourcer {
     private static CurseForgeProjectFile checkLatest(CfMod mod, int currentFileId, List<String> minecraftVersions,
                                                      List<String> loaders, ClientHolder clientHolder) throws Exception {
         CfFile latest = latestCompatibleFile(mod, minecraftVersions, loaders, clientHolder, true);
-        if (latest.id == currentFileId) return null;
+        if (latest.id <= currentFileId) return null;
         return toProjectFile(mod, latest, "mc-mods");
     }
 
@@ -488,7 +488,6 @@ public class CurseForgeSourcer {
                 bestLoader = loader;
             }
         }
-        if (best != null) return best;
         if (mod.latestFilesIndexes != null) {
             for (CfLatestFileIndex index : mod.latestFilesIndexes) {
                 int mc = curseforgeMinecraftIndex(minecraftVersions, index.gameVersion);

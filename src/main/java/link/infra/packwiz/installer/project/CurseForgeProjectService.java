@@ -259,6 +259,15 @@ public class CurseForgeProjectService {
                 mod.option != null && mod.option.optional(),
                 mod.option != null && mod.option.defaultValue());
         }
+        if (latest.fileId() <= cf.fileId()) {
+            return new UpdateResult(entry.file.rebase(repository.rootPath()).path(), mod.name,
+                cf.projectId(), cf.fileId(), cf.fileId(),
+                mod.filename != null ? mod.filename.filename() : "", mod.download != null ? mod.download.hash() : "",
+                mod.filename != null ? mod.filename.filename() : "",
+                "已是最新", false, PackRepository.sideName(mod),
+                mod.option != null && mod.option.optional(),
+                mod.option != null && mod.option.defaultValue());
+        }
         return new UpdateResult(entry.file.rebase(repository.rootPath()).path(), latest.name(),
             latest.projectId(), cf.fileId(), latest.fileId(), latest.filename(), latest.sha1(),
             mod.filename != null ? mod.filename.filename() : "",
