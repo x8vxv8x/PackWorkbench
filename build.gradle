@@ -5,11 +5,11 @@ plugins {
 }
 
 def appName = 'PackWorkbench'
-def appVersion = '1.0.1'
+def appVersion = '1.0.2'
 
 java {
 	toolchain {
-		languageVersion = JavaLanguageVersion.of(25)
+		languageVersion = JavaLanguageVersion.of(21)
 	}
 }
 
@@ -44,7 +44,7 @@ jar {
 
 tasks.withType(JavaCompile).configureEach {
 	options.encoding = 'UTF-8'
-	options.compilerArgs.addAll(['-parameters', '--release', '25'])
+	options.compilerArgs.addAll(['-parameters', '--release', '21'])
 }
 
 tasks.withType(Test).configureEach {

@@ -13,10 +13,12 @@ import link.infra.packwiz.installer.project.IndexRefresher;
 import link.infra.packwiz.installer.project.LinkMetadataResolver;
 import link.infra.packwiz.installer.project.MetadataWriter;
 import link.infra.packwiz.installer.project.ModMetadataEditor;
+import link.infra.packwiz.installer.project.ModLoaderVersionService;
 import link.infra.packwiz.installer.project.PackInitializer;
 import link.infra.packwiz.installer.project.PackRepository;
 import link.infra.packwiz.installer.sync.SyncManager;
 import link.infra.packwiz.installer.target.path.PackwizFilePath;
+import link.infra.packwiz.installer.util.AppShutdown;
 import link.infra.packwiz.installer.util.Log;
 
 import javax.swing.*;
@@ -32,11 +34,15 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class WorkbenchWindow extends JFrame {
     private InstallerConfig config;
     private Path projectRoot;
     private PackRepository repository;
+    private final ModLoaderVersionService initVersionService = new ModLoaderVersionService();
+    private final AtomicInteger initLoaderVersionRequest = new AtomicInteger();
+    private boolean initVersionControlsUpdating;
 
     private final JTextField projectField = new JTextField();
     private final JLabel packSummary = new JLabel("未打开项目");
@@ -73,7 +79,7 @@ public class WorkbenchWindow extends JFrame {
     private final JComboBox<String> initMinecraftBox = new JComboBox<>(new String[]{
         "1.20.1", "1.19.2", "1.18.2", "1.16.5", "1.12.2", "1.7.10"
     });
-    private final JComboBox<String> initLoaderBox = new JComboBox<>(new String[]{"forge", "fabric", "quilt", "neoforge", "none"});
+    private final JComboBox<String> initLoaderBox = new JComboBox<>(new String[]{"quilt", "fabric", "forge", "neoforge", "liteloader", "none"});
     private final JComboBox<String> initLoaderVersionBox = new JComboBox<>(new String[]{
         "", "47.4.0", "43.4.0", "40.3.0", "36.2.42", "14.23.5.2860", "0.16.14"
     });
@@ -86,6 +92,8 @@ public class WorkbenchWindow extends JFrame {
         this.repository = new PackRepository(projectRoot);
         initMinecraftBox.setEditable(true);
         initLoaderVersionBox.setEditable(true);
+        AppShutdown.register(initVersionService);
+        setupInitVersionControls();
 
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         addWindowListener(new WindowAdapter() {
@@ -100,6 +108,7 @@ public class WorkbenchWindow extends JFrame {
         buildUI();
         setupLogListener();
         openProject(projectRoot);
+        refreshInitMinecraftVersions();
     }
 
     private void buildUI() {
@@ -329,6 +338,98 @@ public class WorkbenchWindow extends JFrame {
         init.addActionListener(e -> initializePack());
         addRow(panel, "", init);
         return new JScrollPane(panel);
+    }
+
+    private void setupInitVersionControls() {
+        initMinecraftBox.addActionListener(e -> refreshInitLoaderVersions());
+        initLoaderBox.addActionListener(e -> refreshInitLoaderVersions());
+    }
+
+    private void refreshInitMinecraftVersions() {
+        Thread thread = new Thread(() -> {
+            try {
+                var versions = initVersionService.fetchMinecraftVersions();
+                SwingUtilities.invokeLater(() -> {
+                    initVersionControlsUpdating = true;
+                    try {
+                        setComboItems(initMinecraftBox, versions.versions(), versions.latestRelease());
+                    } finally {
+                        initVersionControlsUpdating = false;
+                    }
+                    refreshInitLoaderVersions();
+                });
+            } catch (Exception e) {
+                Log.warn("获取 Minecraft 版本失败，将使用内置列表: " + e.getMessage());
+                SwingUtilities.invokeLater(this::refreshInitLoaderVersions);
+            }
+        }, "packworkbench-init-minecraft-versions");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void refreshInitLoaderVersions() {
+        if (initVersionControlsUpdating) return;
+
+        int requestId = initLoaderVersionRequest.incrementAndGet();
+        String loader = String.valueOf(initLoaderBox.getSelectedItem()).trim().toLowerCase(Locale.ROOT);
+        if (loader.isBlank() || "none".equals(loader)) {
+            initVersionControlsUpdating = true;
+            try {
+                initLoaderVersionBox.setModel(new DefaultComboBoxModel<>(new String[]{""}));
+                initLoaderVersionBox.setSelectedItem("");
+                initLoaderVersionBox.setEnabled(false);
+            } finally {
+                initVersionControlsUpdating = false;
+            }
+            return;
+        }
+
+        initLoaderVersionBox.setEnabled(true);
+        String minecraftVersion = String.valueOf(initMinecraftBox.getSelectedItem()).trim();
+        if (minecraftVersion.isBlank()) return;
+
+        setComboItems(initLoaderVersionBox, List.of("加载中..."), "加载中...");
+        initLoaderVersionBox.setEnabled(false);
+
+        Thread thread = new Thread(() -> {
+            try {
+                var versions = initVersionService.fetchLoaderVersions(loader, minecraftVersion);
+                SwingUtilities.invokeLater(() -> {
+                    if (requestId != initLoaderVersionRequest.get()) return;
+                    initLoaderVersionBox.setEnabled(true);
+                    setComboItems(initLoaderVersionBox, versions.versions(), versions.latest());
+                });
+            } catch (Exception e) {
+                Log.warn("获取 " + loader + " 版本失败，可手动填写: " + e.getMessage());
+                SwingUtilities.invokeLater(() -> {
+                    if (requestId != initLoaderVersionRequest.get()) return;
+                    initLoaderVersionBox.setEnabled(true);
+                    setComboItems(initLoaderVersionBox, List.of(""), "");
+                });
+            }
+        }, "packworkbench-init-loader-versions");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void setComboItems(JComboBox<String> comboBox, List<String> items, String selected) {
+        String current = comboBox.isEditable() && comboBox.getSelectedItem() != null
+            ? String.valueOf(comboBox.getSelectedItem()).trim()
+            : "";
+        if ("加载中...".equals(current)) current = "";
+        var model = new DefaultComboBoxModel<String>();
+        for (String item : items) {
+            if (item != null && !item.isBlank()) model.addElement(item);
+        }
+        if (model.getSize() == 0) model.addElement("");
+        comboBox.setModel(model);
+        if (selected != null && !selected.isBlank()) {
+            comboBox.setSelectedItem(selected);
+        } else if (!current.isBlank()) {
+            comboBox.setSelectedItem(current);
+        } else {
+            comboBox.setSelectedIndex(0);
+        }
     }
 
     private JPopupMenu assetMenu(JTable table, AssetTableModel model) {
@@ -921,6 +1022,13 @@ public class WorkbenchWindow extends JFrame {
     }
 
     private void initializePack() {
+        String loader = String.valueOf(initLoaderBox.getSelectedItem());
+        String loaderVersion = String.valueOf(initLoaderVersionBox.getSelectedItem()).trim();
+        if (!"none".equalsIgnoreCase(loader) && "加载中...".equals(loaderVersion)) {
+            JOptionPane.showMessageDialog(this, "Loader 版本仍在加载，请稍后再初始化。", "初始化 Pack", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
         runBackground("初始化 Pack", () -> {
             PackInitializer.initialize(
                 projectRoot,
@@ -928,11 +1036,16 @@ public class WorkbenchWindow extends JFrame {
                 initAuthorField.getText().trim(),
                 initVersionField.getText().trim().isBlank() ? "1.0.0" : initVersionField.getText().trim(),
                 String.valueOf(initMinecraftBox.getSelectedItem()).trim(),
-                String.valueOf(initLoaderBox.getSelectedItem()),
-                String.valueOf(initLoaderVersionBox.getSelectedItem()).trim(),
+                loader,
+                loaderVersion,
                 initOverwriteBox.isSelected()
             );
-            SwingUtilities.invokeLater(this::reloadProject);
+            SwingUtilities.invokeLater(() -> {
+                reloadProject();
+                JOptionPane.showMessageDialog(this,
+                    "初始化完成:\n" + projectRoot.resolve("pack.toml"),
+                    "初始化 Pack", JOptionPane.INFORMATION_MESSAGE);
+            });
         });
     }
 
@@ -1040,8 +1153,13 @@ public class WorkbenchWindow extends JFrame {
     }
 
     private void shutdown() {
-        dispose();
-        System.exit(0);
+        AppShutdown.unregister(initVersionService);
+        try {
+            initVersionService.close();
+        } catch (Exception e) {
+            Log.warn("关闭版本查询服务失败: " + e.getMessage());
+        }
+        AppShutdown.exit(0);
     }
 
     private String defaultOutputName(PackFile pack) {

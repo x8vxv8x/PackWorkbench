@@ -3,6 +3,7 @@ package link.infra.packwiz.installer;
 import link.infra.packwiz.installer.config.InstallerConfig;
 import com.formdev.flatlaf.FlatDarkLaf;
 import link.infra.packwiz.installer.ui.gui.WorkbenchWindow;
+import link.infra.packwiz.installer.util.AppShutdown;
 import link.infra.packwiz.installer.util.Log;
 
 import javax.swing.*;
@@ -21,7 +22,7 @@ public class Main {
             InstallerConfig.ensureConfigDir(rootDir);
         } catch (Exception e) {
             Log.fatal("创建配置目录失败", e);
-            System.exit(1);
+            AppShutdown.exit(1);
             return;
         }
 

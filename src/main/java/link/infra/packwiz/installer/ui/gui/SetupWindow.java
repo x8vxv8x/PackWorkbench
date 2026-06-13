@@ -1,14 +1,16 @@
 package link.infra.packwiz.installer.ui.gui;
 
-import link.infra.packwiz.installer.Main;
 import link.infra.packwiz.installer.config.InstallerConfig;
 import link.infra.packwiz.installer.config.InstallerConfig.SyncMode;
 import link.infra.packwiz.installer.target.Side;
+import link.infra.packwiz.installer.util.AppShutdown;
 import link.infra.packwiz.installer.util.Log;
 
 import javax.swing.*;
 import java.awt.*;
 import java.awt.datatransfer.DataFlavor;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.io.File;
 import java.nio.file.Path;
 import java.util.*;
@@ -44,7 +46,13 @@ public class SetupWindow extends JFrame {
         this.config = config;
         this.rootDir = rootDir;
 
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                AppShutdown.exit(0);
+            }
+        });
         setSize(600, 600);
         setLocationRelativeTo(null);
 
@@ -240,7 +248,7 @@ public class SetupWindow extends JFrame {
         // 按钮
         var buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
         var cancelBtn = new JButton("取消");
-        cancelBtn.addActionListener(e -> System.exit(0));
+        cancelBtn.addActionListener(e -> AppShutdown.exit(0));
         var syncBtn = new JButton("同步检查");
         syncBtn.addActionListener(e -> startSync());
         getRootPane().setDefaultButton(syncBtn);
