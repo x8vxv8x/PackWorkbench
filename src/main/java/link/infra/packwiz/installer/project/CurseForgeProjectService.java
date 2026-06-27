@@ -15,6 +15,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 public class CurseForgeProjectService {
     private static final int MAX_DEPENDENCY_CYCLES = 20;
@@ -31,42 +32,55 @@ public class CurseForgeProjectService {
         }
     }
 
-    public List<Path> addProjectWithDependencies(String input, String category, String side,
-                                                 boolean optional, boolean defaultEnabled) throws Exception {
+    public ImportPlan planProjectImport(String input, String category, String side,
+                                        boolean optional, boolean defaultEnabled) throws Exception {
         PackFile pack = repository.loadPack();
-        var written = new ArrayList<Path>();
         var installed = installedCurseForgeProjectIds(pack);
         try (var holder = new CloseableClientHolder()) {
             var main = CurseForgeSourcer.resolveProject(input, pack.supportedMinecraftVersions(), loaders(pack), holder.client());
-            written.add(write(main, category, side, optional, defaultEnabled));
-            installed.add(main.projectId());
-            var queue = new ArrayList<Integer>();
-            for (int depId : main.requiredDependencies()) {
-                queue.add(mapDependency(depId, pack));
-            }
-            int cycles = 0;
-            while (!queue.isEmpty() && cycles < MAX_DEPENDENCY_CYCLES) {
-                queue.removeIf(installed::contains);
-                if (queue.isEmpty()) break;
-                var current = new LinkedHashSet<>(queue);
-                queue.clear();
-                var deps = CurseForgeSourcer.resolveProjects(current, pack.supportedMinecraftVersions(), loaders(pack), holder.client());
-                for (var dep : deps) {
-                    int depId = dep.projectId();
-                    if (installed.contains(depId)) continue;
-                    written.add(write(dep, "mods", "both", false, true));
-                    installed.add(dep.projectId());
-                    for (int next : dep.requiredDependencies()) {
-                        int mapped = mapDependency(next, pack);
-                        if (!installed.contains(mapped) && !queue.contains(mapped)) queue.add(mapped);
-                    }
-                }
-                cycles++;
-            }
-            if (cycles >= MAX_DEPENDENCY_CYCLES && !queue.isEmpty()) {
-                throw new IllegalStateException("CurseForge 依赖递归过深，已停止在 " + MAX_DEPENDENCY_CYCLES + " 轮");
-            }
+            var mainEntry = new ImportEntry(
+                main,
+                normalizeCategory(category, main.category()),
+                side,
+                optional,
+                defaultEnabled,
+                installed.contains(main.projectId())
+            );
+            var dependencies = resolveDependencies(main, pack, installed, side, holder.client());
+            return new ImportPlan(mainEntry, dependencies);
         }
+    }
+
+    public List<Path> importProject(ImportPlan plan, List<Integer> selectedDependencyProjectIds) throws Exception {
+        if (plan == null) throw new IllegalArgumentException("导入计划不能为空");
+        PackFile pack = repository.loadPack();
+        var written = new ArrayList<Path>();
+        var installed = installedCurseForgeProjectIds(pack);
+
+        written.add(write(
+            plan.main().file(),
+            plan.main().category(),
+            plan.main().side(),
+            plan.main().optional(),
+            plan.main().defaultEnabled()
+        ));
+        installed.add(plan.main().projectId());
+
+        Set<Integer> selected = selectedDependencyProjectIds == null
+            ? Set.of()
+            : new LinkedHashSet<>(selectedDependencyProjectIds);
+        for (var dependency : plan.dependencies()) {
+            if (!selected.contains(dependency.projectId()) || dependency.alreadyInstalled() || installed.contains(dependency.projectId())) continue;
+            written.add(write(
+                dependency.file(),
+                dependency.category(),
+                dependency.side(),
+                dependency.optional(),
+                dependency.defaultEnabled()
+            ));
+            installed.add(dependency.projectId());
+        }
+
         new IndexRefresher(repository).refreshAndWrite();
         return written;
     }
@@ -357,6 +371,76 @@ public class CurseForgeProjectService {
             case "shaders" -> "shaderpacks";
             default -> "mods";
         };
+    }
+
+    private List<ImportEntry> resolveDependencies(CurseForgeSourcer.CurseForgeProjectFile main,
+                                                  PackFile pack,
+                                                  LinkedHashSet<Integer> installed,
+                                                  String side,
+                                                  ClientHolder clientHolder) throws Exception {
+        var planned = new ArrayList<ImportEntry>();
+        var plannedIds = new LinkedHashSet<Integer>();
+        var queue = new ArrayList<Integer>();
+        for (int depId : main.requiredDependencies()) {
+            int mapped = mapDependency(depId, pack);
+            if (!installed.contains(mapped) && !queue.contains(mapped)) queue.add(mapped);
+        }
+
+        int cycles = 0;
+        while (!queue.isEmpty() && cycles < MAX_DEPENDENCY_CYCLES) {
+            var current = new LinkedHashSet<>(queue);
+            queue.clear();
+            var deps = CurseForgeSourcer.resolveProjects(current, pack.supportedMinecraftVersions(), loaders(pack), clientHolder);
+            for (var dep : deps) {
+                int depId = dep.projectId();
+                if (plannedIds.contains(depId)) continue;
+                boolean alreadyInstalled = installed.contains(depId);
+                planned.add(new ImportEntry(
+                    dep,
+                    normalizeCategory(null, dep.category()),
+                    side,
+                    false,
+                    true,
+                    alreadyInstalled
+                ));
+                plannedIds.add(depId);
+                if (!alreadyInstalled) {
+                    for (int next : dep.requiredDependencies()) {
+                        int mapped = mapDependency(next, pack);
+                        if (!plannedIds.contains(mapped) && !queue.contains(mapped)) {
+                            queue.add(mapped);
+                        }
+                    }
+                }
+            }
+            cycles++;
+        }
+        if (cycles >= MAX_DEPENDENCY_CYCLES && !queue.isEmpty()) {
+            throw new IllegalStateException("CurseForge 依赖递归过深，已停止在 " + MAX_DEPENDENCY_CYCLES + " 轮");
+        }
+        return planned;
+    }
+
+    public record ImportPlan(
+        ImportEntry main,
+        List<ImportEntry> dependencies
+    ) {}
+
+    public record ImportEntry(
+        CurseForgeSourcer.CurseForgeProjectFile file,
+        String category,
+        String side,
+        boolean optional,
+        boolean defaultEnabled,
+        boolean alreadyInstalled
+    ) {
+        public int projectId() {
+            return file.projectId();
+        }
+
+        public String name() {
+            return file.name();
+        }
     }
 
     public record UpdateResult(

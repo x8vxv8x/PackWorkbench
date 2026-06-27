@@ -22,7 +22,10 @@ import link.infra.packwiz.installer.util.AppShutdown;
 import link.infra.packwiz.installer.util.Log;
 
 import javax.swing.*;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 import javax.swing.table.AbstractTableModel;
+import javax.swing.table.TableRowSorter;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
@@ -35,6 +38,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class WorkbenchWindow extends JFrame {
     private InstallerConfig config;
@@ -59,11 +63,15 @@ public class WorkbenchWindow extends JFrame {
     private JTable localJarsTable;
     private final JTextField compatJarTabNameField = new JTextField();
     private final JTextField compatJarFolderField = new JTextField();
+    private final JTextField modsSearchField = new JTextField();
+    private final JLabel modsFilterSummary = new JLabel("显示 0 / 0");
+    private TableRowSorter<AssetTableModel> modsSorter;
 
     private final JComboBox<String> addCategoryBox = new JComboBox<>(new String[]{"mods", "resourcepacks", "shaderpacks"});
     private final JComboBox<String> addSourceBox = new JComboBox<>(new String[]{"自动", "CurseForge", "URL"});
     private final JTextField addLinkField = new JTextField();
     private final JComboBox<String> addSideBox = new JComboBox<>(new String[]{"both", "client", "server"});
+    private final JCheckBox addDependenciesBox = new JCheckBox("导入前置依赖", true);
     private final JCheckBox addOptionalBox = new JCheckBox("可选");
     private final JCheckBox addDefaultBox = new JCheckBox("默认启用", true);
     private final JTextArea resolvedPreview = new JTextArea(8, 24);
@@ -90,6 +98,10 @@ public class WorkbenchWindow extends JFrame {
         this.config = config;
         this.projectRoot = rootDir.toAbsolutePath().normalize();
         this.repository = new PackRepository(projectRoot);
+        configureTextFieldColumns(projectField, 28);
+        configureTextFieldColumns(addLinkField, 28);
+        configureTextFieldColumns(exportPathField, 28);
+        configureTextFieldColumns(compatJarFolderField, 28);
         initMinecraftBox.setEditable(true);
         initLoaderVersionBox.setEditable(true);
         AppShutdown.register(initVersionService);
@@ -149,10 +161,12 @@ public class WorkbenchWindow extends JFrame {
 
     private JComponent buildAssetsPanel() {
         modsTable = createTable(modsModel);
+        modsSorter = new TableRowSorter<>(modsModel);
+        modsTable.setRowSorter(modsSorter);
         resourcepacksTable = createTable(resourcepacksModel);
         shaderpacksTable = createTable(shaderpacksModel);
         localJarsTable = createLocalJarTable();
-        assetTabs.addTab("Mods (0)", new JScrollPane(modsTable));
+        assetTabs.addTab("Mods (0)", buildModsPanel());
         assetTabs.addTab("Resource Packs (0)", new JScrollPane(resourcepacksTable));
         assetTabs.addTab("Shader Packs (0)", new JScrollPane(shaderpacksTable));
         assetTabs.addTab(config.getCompatJarTabName() + " (0)", buildCompatJarPanel());
@@ -161,6 +175,25 @@ public class WorkbenchWindow extends JFrame {
         title.putClientProperty(FlatClientProperties.STYLE_CLASS, "h2");
         panel.add(title, BorderLayout.NORTH);
         panel.add(assetTabs, BorderLayout.CENTER);
+        return panel;
+    }
+
+    private JComponent buildModsPanel() {
+        modsSearchField.putClientProperty(FlatClientProperties.PLACEHOLDER_TEXT, "按名称搜索 Mods");
+        modsSearchField.getDocument().addDocumentListener(new DocumentListener() {
+            @Override public void insertUpdate(DocumentEvent e) { applyModsFilter(); }
+            @Override public void removeUpdate(DocumentEvent e) { applyModsFilter(); }
+            @Override public void changedUpdate(DocumentEvent e) { applyModsFilter(); }
+        });
+
+        var tools = new JPanel(new BorderLayout(8, 8));
+        tools.setBorder(BorderFactory.createEmptyBorder(8, 8, 0, 8));
+        tools.add(modsSearchField, BorderLayout.CENTER);
+        tools.add(modsFilterSummary, BorderLayout.EAST);
+
+        var panel = new JPanel(new BorderLayout(0, 8));
+        panel.add(tools, BorderLayout.NORTH);
+        panel.add(new JScrollPane(modsTable), BorderLayout.CENTER);
         return panel;
     }
 
@@ -291,6 +324,7 @@ public class WorkbenchWindow extends JFrame {
         addRow(panel, "类型", addSourceBox);
         addRow(panel, "链接", addLinkField);
         addRow(panel, "Side", addSideBox);
+        addRow(panel, "", addDependenciesBox);
         addRow(panel, "", addOptionalBox);
         addRow(panel, "", addDefaultBox);
         resolvedPreview.setEditable(false);
@@ -512,6 +546,10 @@ public class WorkbenchWindow extends JFrame {
         return panel;
     }
 
+    private void configureTextFieldColumns(JTextField field, int columns) {
+        field.setColumns(columns);
+    }
+
     private void addRow(JPanel panel, String label, Component component) {
         int row = panel.getComponentCount() / 2;
         var gbc = new GridBagConstraints();
@@ -596,6 +634,7 @@ public class WorkbenchWindow extends JFrame {
         modsModel.setRows(rows.stream().filter(row -> row.type().equals("mod")).toList());
         resourcepacksModel.setRows(rows.stream().filter(row -> row.type().equals("resourcepack")).toList());
         shaderpacksModel.setRows(rows.stream().filter(row -> row.type().equals("shaderpack")).toList());
+        applyModsFilter();
         assetTabs.setTitleAt(0, "Mods (" + modsModel.getRowCount() + ")");
         assetTabs.setTitleAt(1, "Resource Packs (" + resourcepacksModel.getRowCount() + ")");
         assetTabs.setTitleAt(2, "Shader Packs (" + shaderpacksModel.getRowCount() + ")");
@@ -691,16 +730,60 @@ public class WorkbenchWindow extends JFrame {
 
     private void addCurseForgeProject() {
         runBackground("添加 CurseForge 项目", () -> {
-            var files = new CurseForgeProjectService(repository).addProjectWithDependencies(
+            var service = new CurseForgeProjectService(repository);
+            var plan = service.planProjectImport(
                 addLinkField.getText().trim(),
                 String.valueOf(addCategoryBox.getSelectedItem()),
                 String.valueOf(addSideBox.getSelectedItem()),
                 addOptionalBox.isSelected(),
                 addDefaultBox.isSelected()
             );
+            List<Integer> selectedDependencyIds = List.of();
+            if (addDependenciesBox.isSelected() && !plan.dependencies().isEmpty()) {
+                final boolean[] confirmed = {false};
+                final AtomicReference<List<Integer>> selected = new AtomicReference<>(List.of());
+                SwingUtilities.invokeAndWait(() -> {
+                    var dialog = new DependencySelectionWindow(this, plan);
+                    dialog.setVisible(true);
+                    confirmed[0] = dialog.isConfirmed();
+                    selected.set(dialog.selectedProjectIds());
+                });
+                if (!confirmed[0]) {
+                    Log.info("已取消导入 CurseForge 项目");
+                    return;
+                }
+                selectedDependencyIds = selected.get();
+            }
+            var files = service.importProject(plan, selectedDependencyIds);
             Log.info("已添加 CurseForge 元数据 " + files.size() + " 个");
             SwingUtilities.invokeLater(this::reloadProject);
         });
+    }
+
+    private void applyModsFilter() {
+        if (modsSorter == null) return;
+        String input = modsSearchField.getText() == null ? "" : modsSearchField.getText().trim();
+        if (input.isBlank()) {
+            modsSorter.setRowFilter(null);
+        } else {
+            String normalizedQuery = normalizeSearchKey(input);
+            modsSorter.setRowFilter(new RowFilter<>() {
+                @Override
+                public boolean include(Entry<? extends AssetTableModel, ? extends Integer> entry) {
+                    Object value = entry.getValue(0);
+                    if (value == null) return false;
+                    String normalizedName = normalizeSearchKey(value.toString());
+                    return normalizedName.contains(normalizedQuery);
+                }
+            });
+        }
+        modsFilterSummary.setText("显示 " + modsTable.getRowCount() + " / " + modsModel.getRowCount());
+    }
+
+    private static String normalizeSearchKey(String text) {
+        if (text == null) return "";
+        return text.toLowerCase(Locale.ROOT)
+            .replaceAll("[^\\p{IsAlphabetic}\\p{IsDigit}]+", "");
     }
 
     private void pinSelected(JTable table, AssetTableModel model, boolean pinned) {
@@ -1243,6 +1326,145 @@ public class WorkbenchWindow extends JFrame {
 
         LocalJarRow rowAt(int row) {
             return rows.get(row);
+        }
+    }
+
+    private static class DependencySelectionWindow extends JDialog {
+        private final DependencySelectionTableModel model;
+        private boolean confirmed;
+
+        DependencySelectionWindow(Frame owner, CurseForgeProjectService.ImportPlan plan) {
+            super(owner, "选择前置依赖", true);
+            this.model = new DependencySelectionTableModel(plan.dependencies());
+            setDefaultCloseOperation(DISPOSE_ON_CLOSE);
+            setSize(760, 460);
+            setLocationRelativeTo(owner);
+            setContentPane(buildContent(plan));
+        }
+
+        boolean isConfirmed() {
+            return confirmed;
+        }
+
+        List<Integer> selectedProjectIds() {
+            return model.selectedProjectIds();
+        }
+
+        private JComponent buildContent(CurseForgeProjectService.ImportPlan plan) {
+            var root = new JPanel(new BorderLayout(12, 12));
+            root.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+            long installedCount = plan.dependencies().stream().filter(CurseForgeProjectService.ImportEntry::alreadyInstalled).count();
+
+            var summary = new JTextArea();
+            summary.setEditable(false);
+            summary.setOpaque(false);
+            summary.setLineWrap(true);
+            summary.setWrapStyleWord(true);
+            summary.setText("主项目: " + plan.main().name()
+                + "\n检测到前置依赖 " + plan.dependencies().size() + " 个，其中已存在 " + installedCount + " 个。"
+                + "\n已存在条目会标记为“已存在，无需导入”，不会重复写入。");
+            root.add(summary, BorderLayout.NORTH);
+
+            JTable table = new JTable(model);
+            table.setRowHeight(28);
+            table.setFillsViewportHeight(true);
+            table.getColumnModel().getColumn(0).setMinWidth(56);
+            table.getColumnModel().getColumn(0).setMaxWidth(72);
+            table.getColumnModel().getColumn(2).setMinWidth(90);
+            table.getColumnModel().getColumn(2).setMaxWidth(110);
+            table.getColumnModel().getColumn(3).setMinWidth(100);
+            table.getColumnModel().getColumn(3).setMaxWidth(150);
+            table.getColumnModel().getColumn(4).setMinWidth(70);
+            table.getColumnModel().getColumn(4).setMaxWidth(90);
+            table.getColumnModel().getColumn(5).setMinWidth(90);
+            table.getColumnModel().getColumn(5).setMaxWidth(110);
+            root.add(new JScrollPane(table), BorderLayout.CENTER);
+
+            JButton selectAll = new JButton("全选");
+            selectAll.addActionListener(e -> model.setAllSelected(true));
+            JButton clear = new JButton("清空");
+            clear.addActionListener(e -> model.setAllSelected(false));
+            JButton cancel = new JButton("取消");
+            cancel.addActionListener(e -> dispose());
+            JButton confirm = new JButton("确认导入");
+            confirm.addActionListener(e -> {
+                confirmed = true;
+                dispose();
+            });
+
+            var left = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+            left.add(selectAll);
+            left.add(clear);
+            var right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+            right.add(cancel);
+            right.add(confirm);
+            var buttons = new JPanel(new BorderLayout());
+            buttons.add(left, BorderLayout.WEST);
+            buttons.add(right, BorderLayout.EAST);
+            root.add(buttons, BorderLayout.SOUTH);
+            return root;
+        }
+    }
+
+    private static class DependencySelectionTableModel extends AbstractTableModel {
+        private final String[] columns = {"导入", "名称", "分类", "状态", "Side", "Project ID", "文件名"};
+        private final List<DependencySelectionRow> rows;
+
+        DependencySelectionTableModel(List<CurseForgeProjectService.ImportEntry> entries) {
+            this.rows = new ArrayList<>();
+            for (var entry : entries) {
+                rows.add(new DependencySelectionRow(!entry.alreadyInstalled(), entry));
+            }
+        }
+
+        void setAllSelected(boolean selected) {
+            for (var row : rows) row.selected = selected;
+            fireTableDataChanged();
+        }
+
+        List<Integer> selectedProjectIds() {
+            return rows.stream()
+                .filter(row -> row.selected)
+                .map(row -> row.entry.projectId())
+                .toList();
+        }
+
+        @Override public int getRowCount() { return rows.size(); }
+        @Override public int getColumnCount() { return columns.length; }
+        @Override public String getColumnName(int column) { return columns[column]; }
+        @Override public Class<?> getColumnClass(int columnIndex) {
+            return columnIndex == 0 ? Boolean.class : String.class;
+        }
+        @Override public boolean isCellEditable(int rowIndex, int columnIndex) {
+            return columnIndex == 0 && !rows.get(rowIndex).entry.alreadyInstalled();
+        }
+        @Override public Object getValueAt(int rowIndex, int columnIndex) {
+            DependencySelectionRow row = rows.get(rowIndex);
+            return switch (columnIndex) {
+                case 0 -> row.selected;
+                case 1 -> row.entry.name();
+                case 2 -> row.entry.category();
+                case 3 -> row.entry.alreadyInstalled() ? "已存在，无需导入" : "待导入";
+                case 4 -> row.entry.side();
+                case 5 -> String.valueOf(row.entry.projectId());
+                case 6 -> row.entry.file().filename();
+                default -> "";
+            };
+        }
+        @Override public void setValueAt(Object aValue, int rowIndex, int columnIndex) {
+            if (columnIndex != 0 || rows.get(rowIndex).entry.alreadyInstalled()) return;
+            rows.get(rowIndex).selected = Boolean.TRUE.equals(aValue);
+            fireTableCellUpdated(rowIndex, columnIndex);
+        }
+
+        private static class DependencySelectionRow {
+            private boolean selected;
+            private final CurseForgeProjectService.ImportEntry entry;
+
+            private DependencySelectionRow(boolean selected, CurseForgeProjectService.ImportEntry entry) {
+                this.selected = selected;
+                this.entry = entry;
+            }
         }
     }
 
