@@ -81,7 +81,7 @@ public class ModFile {
         mf.filename = filenameStr != null ? basePath.resolve(filenameStr) : null;
 
         String sideStr = toml.getString("side");
-        mf.side = sideStr != null ? Side.from(sideStr) : Side.BOTH;
+        mf.side = sideStr == null || sideStr.isBlank() ? Side.BOTH : Side.from(sideStr);
         Boolean pin = toml.getBoolean("pin");
         mf.pin = pin != null && pin;
 
